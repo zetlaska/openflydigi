@@ -76,15 +76,18 @@ STARTED = []
 # and the drawer offers the ones belonging to whichever device is selected.
 ALL_SECTIONS = ["Devices", "Controller", "Device", "Buttons", "Macros",
                 "Sticks", "Gyro", "Vibration", "Triggers", "Lighting",
-                "Screen", "Games", "DualSense", "Dock", "Setup"]
+                "Screen", "Games", "DualSense", "Dock", "Vader 4 Pro", "Setup"]
 
 # What the sidebar offers with a pad selected, which is how the window starts.
-SECTIONS = [name for name in ALL_SECTIONS if name != "Dock"]
+SECTIONS = [name for name in ALL_SECTIONS if name not in ("Dock", "Vader 4 Pro")]
 
 # And with a dock selected. Three, because a pad's pages have nothing to say
 # about a dock -- offering Buttons and Macros there would be offering to edit
 # something that is not on screen.
 DOCK_SECTIONS = ["Devices", "Dock", "Setup"]
+
+# And with a Vader 4 Pro: old protocol, so one page of its own.
+VADER4_SECTIONS = ["Devices", "Vader 4 Pro", "Setup"]
 
 # The real poll intervals, kept so the tests that shorten them can put them
 # back -- they are module globals, and leaving one at 50 ms would have every
@@ -795,6 +798,55 @@ def test_leaving_a_section_destroys_its_page(qt_app):
     app_object.shutdown()
 
 
+def test_a_vader_4_gets_its_own_page_and_nothing_else(qt_app):
+    """The Vader 4 Pro is listed beside the mock bus, opens its own page, hides
+    the pad pages, and is read on its own thread -- once on open, never by the
+    pad worker."""
+    from flydigi import vader4
+    from tests.test_models import FakeVader4
+    fake = FakeVader4()
+    entry = vader4._entry("usb:/sys/bus/usb/devices/10-6", "xinput", "Flydigi VADER4")
+    real_list = vader4.list_entries
+    vader4.list_entries = lambda: [dict(entry)]
+    try:
+        pad = TestPad()
+        app_object, engine, window = load_shell(qt_app, pad)
+        app_object.vader4._backend = fake
+        app_object.devices.refresh()
+        pump(qt_app, rounds=40)
+        devices = app_object.devices
+        check("the Vader 4 Pro is listed beside the mock bus",
+              devices.count == 4 and devices.vader4Count == 1,
+              f"{devices.count}/{devices.vader4Count}")
+        check("listing it read nothing", fake.calls == [], str(fake.calls))
+        worker_selector = app_object.thread.worker._selector
+        devices.select(3)
+        pump(qt_app, rounds=40)
+        offered = window.property("drawerSections").toVariant() or []
+        check("the sidebar is the Vader 4's", offered == VADER4_SECTIONS, str(offered))
+        check("and its page is open",
+              window.property("openPageTitle") == "Vader 4 Pro",
+              str(window.property("openPageTitle")))
+        check("opening it read the pad once, on a thread",
+              fake.calls == [("snapshot", "usb:/sys/bus/usb/devices/10-6", True)],
+              str(fake.calls))
+        check("and the page has what it read",
+              app_object.vader4.firmware == "6.9.3.3" and not app_object.vader4.busy)
+        check("the pad worker was not pointed at it",
+              app_object.thread.worker._selector == worker_selector,
+              str(app_object.thread.worker._selector))
+        check("its battery timer runs while the page is up",
+              app_object.vader4.polling)
+        devices.select(0)
+        pump(qt_app, rounds=20)
+        check("and stops when it is not", not app_object.vader4.polling)
+        check("the pad's pages come back",
+              (window.property("drawerSections").toVariant() or []) == SECTIONS)
+        app_object.shutdown()
+    finally:
+        vader4.list_entries = real_list
+
+
 def main():
     QQuickStyle.setStyle("org.kde.desktop")
     qt_app = QGuiApplication.instance() or QGuiApplication([])
@@ -808,6 +860,7 @@ def main():
                  test_leaving_a_section_destroys_its_page,
                      test_the_sidebar_follows_the_selected_device,
                      test_choosing_another_pad_does_not_move_the_page,
+                     test_a_vader_4_gets_its_own_page_and_nothing_else,
                      test_the_i18n_functions_are_installed,
                      test_a_game_list_update_that_fails_is_reported,
                      test_a_game_list_update_that_succeeds_replaces_the_list,

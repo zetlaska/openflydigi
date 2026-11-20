@@ -34,6 +34,7 @@ from .screen import FIT_MODES, MAX_FRAMES, ScreenModel
 from .settings import (PRECISION_NAMES, PRECISION_WIRE, SENSITIVITY_NAMES,
                        SENSITIVITY_WIRE, SettingsModel)
 from .setup import SetupChecksModel, SetupModel
+from .vader4 import Vader4Model
 
 __all__ = [
     "ALL_ROUTES", "APPLIABLE_ROUTE", "BATTERY_STEPS", "CURVE_PRESETS",
@@ -55,6 +56,7 @@ __all__ = [
     "MacroStepsModel",
     "MotionModel", "ProfileListModel", "ProfileModel",
     "ScreenModel", "SettingsModel", "SetupChecksModel", "SetupModel",
+    "Vader4Model",
     "StickModel", "StickSideModel", "TriggerModel", "TriggerSideModel",
     "VibrationModel", "VibrationSideModel",
     "from_hex", "game_name", "invert_cycle", "key_label", "route_detail",

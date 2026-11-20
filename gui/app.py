@@ -25,7 +25,8 @@ from flydigi import games
 
 from .models import (DeviceModel, DevicesModel, DockModel, DsModeModel,
                      GameFilterModel, GameListModel, LightingModel,
-                     ProfileModel, ScreenModel, SettingsModel, SetupModel)
+                     ProfileModel, ScreenModel, SettingsModel, SetupModel,
+                     Vader4Model)
 from .worker import DeviceThread
 
 # See gui/models/device.py for what these two names do.
@@ -97,6 +98,8 @@ class App(QObject):
         self._settings = SettingsModel(self)
         self._setup = SetupModel(self)
         self._dsmode = DsModeModel(self)
+        # The Vader 4 Pro: old protocol, its own page, its own short sessions.
+        self._vader4 = Vader4Model(self)
         # A failed setup action is the same kind of news as a failed device
         # one, so it goes to the same inline message rather than a second
         # channel the user has to learn to look at.
@@ -121,6 +124,8 @@ class App(QObject):
         # see `worker.select_pad`. It is hung off the worker's reply, in
         # `start()`, so the reads are queued behind a switch that has happened.
         self._devices.dockSelected.connect(self._dock.setSelector)
+        # Not the worker: nothing holds a Vader 4 Pro, see gui/models/vader4.py.
+        self._devices.vader4Selected.connect(self._vader4.setSelector)
 
         self._info_timer = QTimer(self)
         self._info_timer.timeout.connect(self.requestInfo)
@@ -246,6 +251,9 @@ class App(QObject):
         # now, and closing this window is no reason to take a pad away from a
         # game. Only the model's own short-lived thread is waited for.
         self._dsmode.wait(5000)
+        # A Vader 4 Pro session in flight is a second or two, and must finish:
+        # it is what gives the gamepad back to xpad.
+        self._vader4.wait(5000)
         # The picture encode, for the same reason. It is the one most likely to
         # be running when a window closes -- it starts on every crop gesture --
         # and this is the path that has to stop it, not `aboutToQuit`: nothing
@@ -316,6 +324,11 @@ class App(QObject):
     def dock(self):
         """The charging dock the dock pages are showing, if one is selected."""
         return self._dock
+
+    @Property(Vader4Model, constant=True)
+    def vader4(self):
+        """The Vader 4 Pro its page is showing, read one session at a time."""
+        return self._vader4
 
     @Property(DeviceModel, constant=True)
     def device(self):

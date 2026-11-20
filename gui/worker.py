@@ -20,7 +20,7 @@ import time
 
 from flydigi import (blobs, charger, device, effects, identity, lighting,
                      macros, mapping, motion, registry, screen, screen_ota,
-                     settings)
+                     settings, vader4)
 
 # The one piece of user-facing text this file needs. It lives with the model
 # because a label that only existed in a QML page would leave the status line
@@ -183,6 +183,13 @@ class DeviceWorker(QObject):
         except OSError as exc:
             self.failed.emit(f"looking for devices: {exc}")
             return
+        # A Vader 4 Pro is listed from sysfs alone -- no exchange, because an
+        # XInput exchange takes the gamepad away from xpad, and this runs on a
+        # timer. Its page reads the pad when it is opened.
+        try:
+            entries = entries + vader4.list_entries()
+        except OSError:
+            pass
         self.devices_changed.emit(entries)
 
     @Slot(str)

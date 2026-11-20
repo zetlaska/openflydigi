@@ -36,7 +36,7 @@ from PySide6.QtCore import (Property, QAbstractListModel, QModelIndex, Qt,
                             Signal, Slot)
 from PySide6.QtQml import QmlElement
 
-from flydigi import identity, prefs, registry
+from flydigi import identity, prefs, registry, vader4
 
 # See gui/models/device.py for what these two names do.
 QML_IMPORT_NAME = "Apex5"
@@ -45,7 +45,12 @@ QML_IMPORT_MAJOR_VERSION = 1
 # One per kind, since the sidebar's icon and the picker's have to agree and
 # there is no third place to put them.
 ICONS = {registry.KIND_PAD: "input-gaming",
-         registry.KIND_DOCK: "battery-full-charging"}
+         registry.KIND_DOCK: "battery-full-charging",
+         vader4.KIND: "input-gaming"}
+
+# How a Vader 4 Pro is attached, for the second line of its row.
+VADER4_MODES = {"xinput": "XInput, through the 2.4G dongle or cable",
+                "dinput": "DInput (Android/PC-DInput mode)"}
 
 
 def detail(entry):
@@ -56,6 +61,10 @@ def detail(entry):
     node, which are the only things two identical pads do not share.
     """
     parts = [entry.get("model") or entry.get("product") or "unrecognised"]
+    if entry["kind"] == vader4.KIND:
+        # Its own page, its own protocol: neither the pad routes nor the
+        # daemon drive it, so "not driven by this app" would be wrong too.
+        parts.append(VADER4_MODES.get(entry.get("connect_type"), "attached"))
     if entry.get("mock"):
         parts.append("mock")
     parts.append(entry["path"])
@@ -134,11 +143,15 @@ class DevicesModel(QAbstractListModel):
     currentChanged = Signal()
     padChanged = Signal()
     dockChanged = Signal()
+    vader4Changed = Signal()
     # Asking the worker to look at the bus, since enumerating blocks.
     refreshRequested = Signal()
     # A device was selected: the worker drops whatever handle it held.
     padSelected = Signal(str)
     dockSelected = Signal(str)
+    # A Vader 4 Pro was selected. Nothing holds it: its page opens a session
+    # per action, so this only tells that page which one.
+    vader4Selected = Signal(str)
 
     def __init__(self, parent=None, settings=None):
         super().__init__(parent)
@@ -152,6 +165,8 @@ class DevicesModel(QAbstractListModel):
         self._current = -1
         self._pad = ""
         self._dock = ""
+        self._vader4 = ""
+        self._vader4_count = 0
         # The preferences file, shared with the daemon and with the Games page.
         # Injectable so a test can point it somewhere that is not the user's.
         self._prefs = settings if settings is not None else prefs.Prefs()
@@ -209,6 +224,8 @@ class DevicesModel(QAbstractListModel):
                               if e["kind"] == registry.KIND_PAD)
         self._dock_count = sum(1 for e in entries
                                if e["kind"] == registry.KIND_DOCK)
+        self._vader4_count = sum(1 for e in entries
+                                 if e["kind"] == vader4.KIND)
         self._has_mock = any(e.get("mock") for e in entries)
 
     def data(self, index, role=Qt.DisplayRole):
@@ -338,7 +355,10 @@ class DevicesModel(QAbstractListModel):
         return roles
 
     def _reselect(self):
-        wanted = self._pad if self.currentKind != registry.KIND_DOCK else self._dock
+        # Each kind keeps its own selection: the Vader 4 Pro on screen must not
+        # be swapped for the pad on the next enumeration poll.
+        wanted = {registry.KIND_DOCK: self._dock,
+                  vader4.KIND: self._vader4}.get(self.currentKind, self._pad)
         row = self._row_for(wanted)
         if row < 0:
             # Whatever this kind's selection was, it is not here. Fall back to
@@ -350,6 +370,22 @@ class DevicesModel(QAbstractListModel):
             row = 0 if self._entries else -1
         self._set_current(row, remember=False)
         self._adopt_dock()
+        self._adopt_vader4()
+
+    def _adopt_vader4(self):
+        """The Vader 4 Pro page's answer to `_adopt_dock`: point it at the one
+        on the bus when nobody has picked one, or the one picked has gone."""
+        if self._vader4 and self._row_for(self._vader4) >= 0:
+            return
+        row = self._row_for_kind(vader4.KIND)
+        if row < 0:
+            return
+        selector = self._rows[row][self.SelectorRole]
+        if not selector or selector == self._vader4:
+            return
+        self._vader4 = selector
+        self.vader4Changed.emit()
+        self.vader4Selected.emit(selector)
 
     def _adopt_dock(self):
         """Point the dock pages at a dock nobody has explicitly chosen.
@@ -431,6 +467,14 @@ class DevicesModel(QAbstractListModel):
             self.dockChanged.emit()
             self.dockSelected.emit(selector)
             return
+        if decoded[self.KindRole] == vader4.KIND:
+            # Never the preferences file and never `padSelected`: the daemon
+            # and the pad worker speak the 37d7 protocol, and this pad is not
+            # one. Its page reads it, one short session at a time.
+            self._vader4 = selector
+            self.vader4Changed.emit()
+            self.vader4Selected.emit(selector)
+            return
         if selector != self._pad:
             self._pad = selector
             # The daemon reads this file for every route that holds one pad.
@@ -474,6 +518,19 @@ class DevicesModel(QAbstractListModel):
     @Property(bool, notify=currentChanged)
     def currentIsDock(self):
         return self.currentKind == registry.KIND_DOCK
+
+    @Property(bool, notify=currentChanged)
+    def currentIsVader4(self):
+        return self.currentKind == vader4.KIND
+
+    @Property(str, notify=vader4Changed)
+    def vader4(self):
+        """The selector for the Vader 4 Pro its page is showing."""
+        return self._vader4
+
+    @Property(int, notify=countChanged)
+    def vader4Count(self):
+        return self._vader4_count
 
     @Property(str, notify=currentChanged)
     def currentCode(self):

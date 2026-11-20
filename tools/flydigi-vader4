@@ -22,9 +22,6 @@ Writes refuse to run without --experimental-write, and refuse anything whose
 device type is not 105. See flydigi/vader4.py for what is and is not known.
 """
 import argparse
-import datetime
-import hashlib
-import json
 import os
 import signal
 import sys
@@ -53,48 +50,15 @@ def open_ctrl(args):
     return vader4.Controller(path)
 
 
-BACKUP_DIR = os.path.expanduser("~/.local/share/openflydigi/backups")
+BACKUP_DIR = vader4.BACKUP_DIR
 
 
 def save_backup(blob, info, label="lighting"):
-    """Raw blob plus a JSON sidecar of what it decodes to. Returns the .bin path."""
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    stamp = datetime.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
-    path = os.path.join(BACKUP_DIR, f"vader4-{label}-{stamp}.bin")
-    n = 1
-    while os.path.exists(path):
-        path = os.path.join(BACKUP_DIR, f"vader4-{label}-{stamp}-{n}.bin")
-        n += 1
-    with open(path, "xb") as fh:
-        fh.write(blob)
-    side = {
-        "file": os.path.basename(path),
-        "saved": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-        "sha256": hashlib.sha256(blob).hexdigest(),
-        "device_type": info.device_type if info else None,
-        "firmware": info.firmware if info else None,
-        "mode": info.mode if info else None,
-        "cfg_id": 0,
-        "lighting": vader4.Lighting(blob).fields(),
-    }
-    with open(path[:-4] + ".json", "w") as fh:
-        json.dump(side, fh, indent=2)
-    return path
+    """Raw blob plus a JSON sidecar; shared with the app (`vader4.save_backup`)."""
+    return vader4.save_backup(blob, info, label, BACKUP_DIR)
 
 
-def load_backup(path):
-    with open(path, "rb") as fh:
-        blob = fh.read()
-    if len(blob) != vader4.LED_BLOB_LEN:
-        raise vader4.ProtocolError(
-            f"{path}: {len(blob)} bytes, expected {vader4.LED_BLOB_LEN}")
-    side = path[:-4] + ".json" if path.endswith(".bin") else None
-    if side and os.path.exists(side):
-        with open(side) as fh:
-            want = json.load(fh).get("sha256")
-        if want and want != hashlib.sha256(blob).hexdigest():
-            raise vader4.ProtocolError(f"{path}: does not match its sidecar sha256")
-    return blob
+load_backup = vader4.load_backup
 
 
 def cmd_list(args):
@@ -144,40 +108,32 @@ def cmd_leds(args):
             print("solid needs a colour", file=sys.stderr)
             return 2
         target_colour = colour(args.arg)
+    if writing:
+        # The one write path, shared with the app: backup, write, read back.
+        r = vader4.apply_lighting(
+            args.device or vader4.find_device(), args.action,
+            colour=target_colour if args.action == "solid" else None,
+            brightness=args.brightness, blob=restore_blob,
+            accept=accepted(args), backup_dir=BACKUP_DIR)
+        numbers = r["acks"]
+        print(f"current: {r['before']}")
+        print(f"backup:  {r['backup']}")
+        print(f"wrote {r['packets']} packets; acks {numbers[:3]}..{numbers[-3:]} "
+              f"({len(numbers)} for {r['packets']} packets)")
+        print(f"readback: {r['describe']} -- "
+              f"{'matches what was written' if r['matched'] else 'DIFFERS from what was written'}")
+        if not r["matched"]:
+            print(f"  {len(r['differing'])} bytes differ, first at {r['differing'][:8]}")
+            return 1
+        return 0
     with open_ctrl(args) as ctrl:
         info = getattr(ctrl, "info", None)
-        if info is None and (writing or args.action == "backup"):
+        if info is None and args.action == "backup":
             info = vader4.require(ctrl, accept=accepted(args))   # DInput
         before = vader4.read_lighting_raw(ctrl)
         print(f"current: {vader4.Lighting(before).describe()}")
         if args.action == "backup":
             print(f"saved {save_backup(before, info)}")
-            return 0
-        if not writing:
-            return 0
-        # Every write keeps what it replaces, restore included.
-        print(f"backup:  {save_backup(before, info, 'lighting-prewrite')}")
-        if restore_blob is not None:
-            light = vader4.Lighting(restore_blob)
-        else:
-            light = vader4.Lighting(before)
-            if args.action == "off":
-                light.set_off()
-            else:
-                light.set_solid(target_colour, args.brightness)
-        acks = []
-        sent = vader4.write_lighting(ctrl, light, acks=acks)
-        numbers = [n for _, n in acks]
-        print(f"wrote {sent} packets; acks {numbers[:3]}..{numbers[-3:]} "
-              f"({len(acks)} for {sent} packets)")
-        after = vader4.read_lighting_raw(ctrl)
-        same = after == bytes(light.blob)
-        print(f"readback: {vader4.Lighting(after).describe()} -- "
-              f"{'matches what was written' if same else 'DIFFERS from what was written'}")
-        if not same:
-            diff = [i for i in range(len(after)) if after[i] != light.blob[i]]
-            print(f"  {len(diff)} bytes differ, first at {diff[:8]}")
-            return 1
     return 0
 
 

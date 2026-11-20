@@ -90,6 +90,10 @@ Kirigami.ApplicationWindow {
         // selected would be offering to edit something that is not on screen.
         {name: "Dock", icon: "battery-full-charging", url: "pages/DockPage.qml",
          kinds: ["dock"]},
+        // The Vader 4 Pro speaks Flydigi's older protocol, so none of the pad
+        // pages above apply to it: it gets one page of its own instead.
+        {name: "Vader 4 Pro", icon: "input-gaming", url: "pages/Vader4Page.qml",
+         kinds: ["vader4"]},
         // Neither device's: udev rules, the daemon's unit and the menu entry
         // belong to the installation.
         {name: "Setup", icon: "configure", url: "pages/SetupPage.qml",
@@ -140,7 +144,9 @@ Kirigami.ApplicationWindow {
         if (deviceKind === shownKind)
             return
         shownKind = deviceKind
-        openSection(indexOfSection(deviceKind === "dock" ? "Dock" : "Controller"))
+        openSection(indexOfSection(deviceKind === "dock" ? "Dock"
+                                   : deviceKind === "vader4" ? "Vader 4 Pro"
+                                   : "Controller"))
     }
 
     // The window's own view of what it is showing. `pageStack` is a Kirigami
@@ -351,6 +357,14 @@ Kirigami.ApplicationWindow {
         property: "polling"
         value: root.currentSection === root.indexOfSection("Controller")
                || root.currentSection === root.indexOfSection("DualSense")
+    }
+
+    // The Vader 4 Pro is read when its page opens and then only its battery,
+    // once a minute -- and only while that page is the one on screen.
+    Binding {
+        target: App.vader4
+        property: "polling"
+        value: root.visible && root.currentSection === root.indexOfSection("Vader 4 Pro")
     }
 
     // Progress messages are transient by nature, so they pass through rather

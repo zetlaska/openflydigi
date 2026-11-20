@@ -47,7 +47,11 @@ import atexit
 import collections
 import contextlib
 import dataclasses
+import datetime
+import fcntl
 import glob
+import hashlib
+import json
 import os
 import threading
 import time
@@ -493,6 +497,51 @@ def find_device():
         "-- wake the pad or check the dongle/cable")
 
 
+# -- one session at a time, across processes ---------------------------------
+#
+# An XInput session takes interface 0 away from xpad, so two at once would be
+# one claiming while the other reattaches. The hidraw node's own flock covers
+# DInput exchanges, but not "the app is mid-write while the CLI starts a read",
+# so every session -- either mode, CLI or app -- holds this file for its whole
+# length. flydigid does not take it because it never opens this pad: it only
+# enumerates 37d7 devices (`device.find_nodes`).
+
+LOCK_ENV = "OPENFLYDIGI_VADER4_LOCK"
+LOCK_TIMEOUT = 10.0
+
+
+def lock_path():
+    if os.environ.get(LOCK_ENV):
+        return os.environ[LOCK_ENV]
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/openflydigi-{os.getuid()}"
+    os.makedirs(runtime, mode=0o700, exist_ok=True)
+    return os.path.join(runtime, "openflydigi-vader4.lock")
+
+
+class SessionLock:
+    def __init__(self, timeout=LOCK_TIMEOUT):
+        self.fd = os.open(lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    os.close(self.fd)
+                    self.fd = None
+                    raise device.DeviceBusy(
+                        "another OpenFlydigi session has the Vader 4 Pro; "
+                        "try again in a moment") from None
+                time.sleep(0.05)
+
+    def release(self):
+        if self.fd is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+            self.fd = None
+
+
 class Controller(device.Controller):
     """A Vader 4 Pro session, in whichever mode the pad is in.
 
@@ -510,7 +559,20 @@ class Controller(device.Controller):
         return super().__new__(cls, path)
 
     def __init__(self, path=None, **kwargs):
-        super().__init__(path)
+        self._session = SessionLock()
+        try:
+            super().__init__(path)
+        except BaseException:
+            self._session.release()
+            raise
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            session = getattr(self, "_session", None)
+            if session is not None:
+                session.release()
 
 
 # -- XInput transport ---------------------------------------------------------
@@ -619,6 +681,11 @@ class PyUsbLink:
             raise OSError(f"could not reattach xpad to {self.sysfs}: {errors[-1]}")
 
 
+# When each XInput frame was last sent, this process -- see `_separate`.
+XINPUT_REPEAT_WINDOW = device.REPEAT_WINDOW
+_SENT_AT = {}
+
+
 class XInputController:
     """Same surface as `Controller` -- `send`, `claim`, `close`, context
     manager -- over the XInput interrupt pipes."""
@@ -632,10 +699,17 @@ class XInputController:
             raise device.DeviceNotFound(
                 f"{sysfs}: product {product!r} is not a VADER4; refusing")
         self.path = XINPUT_PREFIX + sysfs
-        self.link = link if link is not None else PyUsbLink(sysfs)
         self._threads = threading.RLock()
         self.info = None
-        self.link.open()
+        self.link = None
+        self._session = SessionLock()
+        try:
+            self.link = link if link is not None else PyUsbLink(sysfs)
+            self.link.open()
+        except BaseException:
+            self.link = None
+            self._session.release()
+            raise
         atexit.register(self.close)
         try:
             if verify:
@@ -646,9 +720,14 @@ class XInputController:
 
     def close(self):
         link, self.link = getattr(self, "link", None), None
-        if link is not None:
-            atexit.unregister(self.close)
-            link.close()
+        try:
+            if link is not None:
+                atexit.unregister(self.close)
+                link.close()
+        finally:
+            session = getattr(self, "_session", None)
+            if session is not None:
+                session.release()
 
     def __enter__(self):
         return self
@@ -667,27 +746,26 @@ class XInputController:
         finally:
             self._threads.release()
 
-    # **The dongle drops a frame identical to the one before it**, as the Vader
-    # 5's receiver does (device.REPEAT_WINDOW): measured here, an info request
-    # straight after another got no answer, three times running. So a repeat
-    # inside the window is preceded by a read-only separator -- the dongle
-    # version request, or device info when the repeat is itself that.
-    _last_frame = None
-    _last_sent = 0.0
-
+    # **The dongle drops a frame identical to one it was sent moments ago** --
+    # not only the one just before it. Measured on the pad here: an info request
+    # 0.3 s after another got no answer, and neither did info, dongle, info
+    # inside half a second, so a different frame in between (the separator the
+    # 37d7 pads use, `device.Controller._separate`) does not help. One second
+    # or more after the last identical frame was answered every time. So a
+    # repeat waits out XINPUT_REPEAT_WINDOW since that frame was last sent.
+    # Kept per process, not per session: the app opens one session per action,
+    # and "Look again" straight after a write repeats the write's readback.
     def _separate(self, buf):
-        if (bytes(buf) != self._last_frame
-                or time.monotonic() - self._last_sent >= device.REPEAT_WINDOW):
-            return
-        cmd = X_CMD_INFO if buf[1] == X_CMD_DONGLE else X_CMD_DONGLE
-        sep = xinput_command(cmd)
-        self.link.write(sep)
-        self._last_frame, self._last_sent = sep, time.monotonic()
-        deadline = time.monotonic() + 0.25
-        while time.monotonic() < deadline:
-            data = self.link.read(XINPUT_POLL_MS)
-            if data and len(data) > 15 and data[14] == X_MAGIC and data[15] == cmd:
-                return
+        frame = bytes(buf)
+        if len(_SENT_AT) > 512:
+            cutoff = time.monotonic() - XINPUT_REPEAT_WINDOW
+            for old in [f for f, t in _SENT_AT.items() if t < cutoff]:
+                del _SENT_AT[old]
+        last = _SENT_AT.get(frame)
+        if last is not None:
+            left = XINPUT_REPEAT_WINDOW - (time.monotonic() - last)
+            if left > 0:
+                time.sleep(left)
 
     def _drain(self):
         """Drop what is already queued. Bounded: the pipe streams input at
@@ -703,7 +781,7 @@ class XInputController:
             self._drain()
             self._separate(buf)
             self.link.write(buf)
-            self._last_frame, self._last_sent = bytes(buf), time.monotonic()
+            _SENT_AT[bytes(buf)] = time.monotonic()
             replies = []
             deadline = time.monotonic() + wait
             while time.monotonic() < deadline:
@@ -836,3 +914,190 @@ def write_lighting(ctrl, lighting, cfg_id=0, wait=3.0, retries=3, acks=None):
             else:
                 raise ProtocolError(f"no ack for packet {position} of {len(packets)}")
     return len(packets)
+
+
+def read_dongle(ctrl, wait=0.6):
+    """The 2.4G dongle's firmware as "a.b.c.d", or None when wired / no answer."""
+    packet = (xinput_command(X_CMD_DONGLE) if _mode(ctrl) == "xinput"
+              else dinput_command(D_CMD_DONGLE))
+    for r in _replies(ctrl, packet, wait, lambda rs: rs[-1].kind == "dongle"):
+        if r.kind == "dongle":
+            lo, hi = r.data[0], r.data[1]
+            if not (lo or hi):
+                return None
+            return f"{lo >> 4}.{lo & 15}.{hi >> 4}.{hi & 15}"
+    return None
+
+
+# -- backups ------------------------------------------------------------------
+
+BACKUP_DIR = os.path.expanduser("~/.local/share/openflydigi/backups")
+BACKUP_GLOB = "vader4-lighting-*.bin"
+
+
+def save_backup(blob, info=None, label="lighting", directory=None):
+    """Raw lighting blob plus a JSON sidecar of what it decodes to. -> .bin path"""
+    directory = directory or BACKUP_DIR
+    os.makedirs(directory, exist_ok=True)
+    now = datetime.datetime.now().astimezone()
+    stamp = now.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(directory, f"vader4-{label}-{stamp}.bin")
+    n = 1
+    while os.path.exists(path):
+        path = os.path.join(directory, f"vader4-{label}-{stamp}-{n}.bin")
+        n += 1
+    with open(path, "xb") as fh:
+        fh.write(bytes(blob))
+    side = {
+        "file": os.path.basename(path),
+        "saved": now.isoformat(timespec="seconds"),
+        "sha256": hashlib.sha256(bytes(blob)).hexdigest(),
+        "device_type": info.device_type if info else None,
+        "firmware": info.firmware if info else None,
+        "mode": info.mode if info else None,
+        "cfg_id": 0,
+        "lighting": Lighting(blob).fields(),
+    }
+    with open(path[:-4] + ".json", "w") as fh:
+        json.dump(side, fh, indent=2)
+    return path
+
+
+def load_backup(path):
+    """A backup's bytes, refused unless 500 long and matching its sidecar."""
+    with open(path, "rb") as fh:
+        blob = fh.read()
+    if len(blob) != LED_BLOB_LEN:
+        raise ProtocolError(f"{path}: {len(blob)} bytes, expected {LED_BLOB_LEN}")
+    side = path[:-4] + ".json" if path.endswith(".bin") else None
+    if side and os.path.exists(side):
+        with open(side) as fh:
+            want = json.load(fh).get("sha256")
+        if want and want != hashlib.sha256(blob).hexdigest():
+            raise ProtocolError(f"{path}: does not match its sidecar sha256")
+    return blob
+
+
+def list_backups(directory=None, include_prewrite=True):
+    """Backup files, newest first."""
+    directory = directory or BACKUP_DIR
+    paths = glob.glob(os.path.join(directory, BACKUP_GLOB))
+    if not include_prewrite:
+        paths = [p for p in paths if "-prewrite-" not in os.path.basename(p)]
+    return sorted(paths, key=lambda p: (os.path.getmtime(p), p), reverse=True)
+
+
+# -- the bus, without talking to it --------------------------------------------
+
+def list_entries():
+    """Every Vader 4 Pro attached, as registry-shaped entries. **No exchange.**
+
+    Sysfs only, because an XInput probe detaches xpad: the app enumerates on
+    a ten-second timer, and that must never interrupt the gamepad. What the
+    pad itself says (type, firmware, battery) is read by a session the user
+    asks for, on the pad's own page.
+    """
+    from . import mock
+    if mock.enabled() and mock.hide_real():
+        # A mock bus that hides real hardware hides this pad too, or a test
+        # run (or a screenshot) would list whatever is on the developer's desk.
+        return []
+    found = []
+    for path in find_dinput_nodes():
+        found.append(_entry(path, "dinput", device.hid_name(os.path.basename(path))))
+    for dev in find_xinput_devices(vader4_only=True):
+        found.append(_entry(XINPUT_PREFIX + dev, "xinput", _read_attr(dev, "product") or ""))
+    return found
+
+
+KIND = "vader4"
+
+
+def _entry(path, mode, product):
+    return {
+        "path": path, "kind": KIND, "family": None, "product": product,
+        "mock": False, "device_type": None, "code": None,
+        "model": "Vader 4 Pro", "uid": None, "mac": None, "nickname": None,
+        "firmware": None, "battery": None, "charging": None,
+        "connect_type": mode, "supported": True, "info": None, "error": None,
+    }
+
+
+# -- whole sessions, for callers that should not hold the pad -----------------
+
+def _lighting_state(light):
+    first = light.led(0, 0) if light.slots else (0, 0, 0)
+    return {"lighting_mode": light.mode, "lighting_mode_name": light.mode_name,
+            "brightness": light.brightness, "colour": "#%02X%02X%02X" % first,
+            "describe": light.describe()}
+
+
+def _info_state(info, dongle):
+    return {"device_type": info.device_type, "name": info.name,
+            "firmware": info.firmware, "dongle_firmware": dongle,
+            "battery": info.battery_percent, "battery_raw": info.battery_raw,
+            "connection": info.connection, "mode": info.mode}
+
+
+def snapshot(path, lighting=True, accept=ACCEPTED_TYPES, **session):
+    """Open one session, read what the page shows, close (xpad reattached).
+    `session` goes to the controller (tests pass a fake `link`)."""
+    kwargs = dict(session, accept=accept) if path.startswith(XINPUT_PREFIX) else session
+    with Controller(path, **kwargs) as ctrl:
+        info = getattr(ctrl, "info", None) or require(ctrl, accept=accept)
+        state = _info_state(info, read_dongle(ctrl))
+        if lighting:
+            state.update(_lighting_state(read_lighting(ctrl)))
+    return state
+
+
+def apply_lighting(path, action, colour=None, brightness=None, blob=None,
+                   accept=ACCEPTED_TYPES, backup_dir=None, **session):
+    """One lighting write, the only way the app and the CLI write: read what is
+    there, save it as a backup, write, read back and compare.
+
+    `action` is "solid" (colour, brightness), "off", or "restore" (blob).
+    Returns a dict with the backup path, packets, acks, whether the readback
+    matched, and the lighting as read back.
+    """
+    if action == "restore":
+        if blob is None or len(blob) != LED_BLOB_LEN:
+            raise ProtocolError("restore needs a 500-byte lighting blob")
+    elif action == "solid":
+        if colour is None:
+            raise ProtocolError("solid needs a colour")
+    elif action != "off":
+        raise ValueError(f"unknown lighting action {action!r}")
+    kwargs = dict(session, accept=accept) if path.startswith(XINPUT_PREFIX) else session
+    with Controller(path, **kwargs) as ctrl:
+        info = getattr(ctrl, "info", None) or require(ctrl, accept=accept)
+        before = read_lighting_raw(ctrl)
+        saved = save_backup(before, info, "lighting-prewrite", backup_dir)
+        if action == "restore":
+            light = Lighting(blob)
+        else:
+            light = Lighting(before)
+            if action == "off":
+                light.set_off()
+            else:
+                light.set_solid(colour, brightness)
+        acks = []
+        sent = write_lighting(ctrl, light, acks=acks)
+        after = read_lighting_raw(ctrl)
+    result = {"backup": saved, "packets": sent, "acks": [n for _, n in acks],
+              "matched": after == bytes(light.blob),
+              "before": Lighting(before).describe(),
+              "differing": [i for i in range(len(after)) if after[i] != light.blob[i]]}
+    result.update(_lighting_state(Lighting(after)))
+    return result
+
+
+def backup_lighting(path, accept=ACCEPTED_TYPES, backup_dir=None, **session):
+    """Open one session, save the lighting as a backup, close. -> dict"""
+    kwargs = dict(session, accept=accept) if path.startswith(XINPUT_PREFIX) else session
+    with Controller(path, **kwargs) as ctrl:
+        info = getattr(ctrl, "info", None) or require(ctrl, accept=accept)
+        blob = read_lighting_raw(ctrl)
+    state = {"backup": save_backup(blob, info, "lighting", backup_dir)}
+    state.update(_lighting_state(Lighting(blob)))
+    return state

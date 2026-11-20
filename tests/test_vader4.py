@@ -17,10 +17,18 @@ import socket
 import sys
 import tempfile
 import threading
+import time
+
+os.environ.setdefault("OPENFLYDIGI_VADER4_LOCK", os.path.join(
+    tempfile.gettempdir(), f"openflydigi-vader4-test-{os.getpid()}.lock"))
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flydigi import device, vader4  # noqa: E402
+
+# Short, so a fake that answers a retry is not waited on for 1.5 s; the test
+# of the rule itself sets its own.
+vader4.XINPUT_REPEAT_WINDOW = 0.02
 
 TEMP_DIRS = []
 PASSED = []
@@ -543,26 +551,42 @@ def test_xinput_accept_types():
 
 
 def test_xinput_repeat_is_separated():
-    """The dongle ignores a frame identical to the previous one."""
-    last = [None]
+    """The dongle ignores a frame identical to one sent moments before, even
+    with other frames in between (measured: info, dongle, info lost the second
+    info). So a repeat waits out the window instead."""
+    sent = {}
+    window = 0.3
 
     def respond(packet):
-        if packet == last[0]:
+        now = time.monotonic()
+        last, sent[packet] = sent.get(packet), now
+        if last is not None and now - last < window:
             return []
-        last[0] = packet
         if packet[1] == 16:
             return [x_info()]
         if packet[1] == 17:
             return [x_reply(17, b"\x04\x56")]
         return []
-    dev, events, sysfs, link = x_pad(respond=respond)
-    with vader4.XInputController(sysfs, link=link) as ctrl:
-        info = vader4.read_info(ctrl, retries=1)
-        check("repeat info answered", info.device_type == 105)
-        check("a dongle-version separator went between",
-              dev.written[-2] == vader4.xinput_command(17)
-              and dev.written[-1] == vader4.xinput_command(16), [w[1] for w in dev.written])
-    check("separated session reattached", dev.kernel)
+    saved = vader4.XINPUT_REPEAT_WINDOW
+    vader4.XINPUT_REPEAT_WINDOW = window + 0.05
+    vader4._SENT_AT.clear()
+    try:
+        dev, events, sysfs, link = x_pad(respond=respond)
+        with vader4.XInputController(sysfs, link=link) as ctrl:
+            check("dongle between", vader4.read_dongle(ctrl) == "0.4.5.6")
+            start = time.monotonic()
+            info = vader4.read_info(ctrl, retries=1)
+            check("repeat info answered", info.device_type == 105)
+            check("after waiting out the window", time.monotonic() - start >= window * 0.8)
+            check("with no extra frames sent",
+                  [w[1] for w in dev.written] == [16, 17, 16], [w[1] for w in dev.written])
+        check("separated session reattached", dev.kernel)
+        # And across sessions in one process, as the app's are.
+        dev, events, sysfs, link = x_pad(respond=respond)
+        with vader4.XInputController(sysfs, link=link) as ctrl:
+            check("a new session's first info is not lost", ctrl.info.device_type == 105)
+    finally:
+        vader4.XINPUT_REPEAT_WINDOW = saved
 
 
 def _ack_pad(ack_for):
@@ -711,6 +735,127 @@ def test_xinput_discovery_and_dispatch():
     check("dispatch session reattached", dev.kernel)
 
 
+def _store_pad(stored, dongle=b"\x04\x56"):
+    """XInput fake that keeps what is written and serves it back on a read."""
+    store = bytearray(stored)
+    written = {}
+
+    def respond(packet):
+        cmd = packet[1]
+        if cmd == 16:
+            return [x_info(85)]
+        if cmd == 17:
+            return [x_reply(17, dongle)]
+        if cmd == 38:
+            return [x_reply(39, bytes([i]) + bytes(store[i * 10:(i + 1) * 10]))
+                    for i in range(len(store) // 10)]
+        if cmd == 42:
+            written.clear()
+            return [x_reply(42)]
+        if cmd == 41:
+            k = packet[13]
+            written[k] = packet[2:12]
+            if len(written) == len(store) // 10:
+                for i, part in written.items():
+                    store[i * 10:(i + 1) * 10] = part
+            return [x_reply(41, bytes([k + 1]))]
+        return []
+    dev, events, sysfs, link = x_pad(respond=respond)
+    return dev, store, sysfs, link
+
+
+def test_session_lock():
+    first = vader4.SessionLock()
+    try:
+        vader4.SessionLock(timeout=0.1)
+        check("second session refused while one is open", False)
+    except device.DeviceBusy:
+        check("second session refused while one is open", True)
+    first.release()
+    again = vader4.SessionLock(timeout=0.1)
+    check("lock free again after release", again.fd is not None)
+    again.release()
+    dev, events, sysfs, link = x_pad(device_type=85)
+    with vader4.XInputController(sysfs, link=link):
+        try:
+            vader4.SessionLock(timeout=0.1)
+            check("XInput session holds the lock", False)
+        except device.DeviceBusy:
+            check("XInput session holds the lock", True)
+    other = vader4.SessionLock(timeout=0.1)
+    check("XInput close releases the lock", other.fd is not None)
+    other.release()
+    # A refused pad (wrong type) must not leave the lock held.
+    dev, events, sysfs, link = x_pad(device_type=19)
+    try:
+        vader4.XInputController(sysfs, link=link)
+    except vader4.ProtocolError:
+        pass
+    probe = vader4.SessionLock(timeout=0.1)
+    check("refused session released the lock", probe.fd is not None and dev.kernel)
+    probe.release()
+
+
+def test_snapshot_and_apply():
+    stock = bytearray(500)
+    stock[0:2], stock[4], stock[5], stock[6], stock[7], stock[8] = b"\x00\x02", 5, 50, 100, 5, 1
+    stock[20:23] = b"\x32\x32\x00"
+    dev, store, sysfs, link = _store_pad(stock)
+    state = vader4.snapshot(vader4.XINPUT_PREFIX + sysfs, link=link)
+    check("snapshot info", state["device_type"] == 85 and state["firmware"]
+          and state["battery"] is not None, state)
+    check("snapshot dongle firmware", state["dongle_firmware"] == "0.4.5.6", state)
+    check("snapshot lighting", state["lighting_mode_name"] == "streamlined"
+          and state["brightness"] == 100 and state["colour"] == "#323200", state)
+    check("snapshot gave xpad back", dev.kernel)
+    state = vader4.snapshot(vader4.XINPUT_PREFIX + sysfs, lighting=False,
+                            link=_store_pad(stock)[3])
+    check("info-only snapshot", "lighting_mode" not in state and state["device_type"] == 85)
+    _, _, _, wired = _store_pad(stock, dongle=b"\x00\x00")
+    check("no dongle reads as None",
+          vader4.snapshot(vader4.XINPUT_PREFIX + sysfs, False, link=wired)["dongle_firmware"] is None)
+
+    backups = tempfile.mkdtemp(prefix="vader4-apply-")
+    TEMP_DIRS.append(backups)
+    dev, store, sysfs, link = _store_pad(stock)
+    r = vader4.apply_lighting(vader4.XINPUT_PREFIX + sysfs, "solid", colour=(0, 0xE5, 0xFF),
+                              brightness=60, backup_dir=backups, link=link)
+    check("solid applied and read back", r["matched"] and r["lighting_mode_name"] == "steady"
+          and r["colour"] == "#00E5FF" and r["brightness"] == 60, r)
+    check("solid kept a prewrite backup of the stock lighting",
+          open(r["backup"], "rb").read() == bytes(stock) and "-prewrite-" in r["backup"])
+    check("51 acks", r["packets"] == 51 and len(r["acks"]) == 51)
+    check("apply gave xpad back", dev.kernel)
+    listed = vader4.list_backups(backups)
+    check("list_backups finds it", listed == [r["backup"]])
+    check("list_backups can skip prewrites", vader4.list_backups(backups, include_prewrite=False) == [])
+
+    dev, store, sysfs, link = _store_pad(bytes(store))
+    r = vader4.apply_lighting(vader4.XINPUT_PREFIX + sysfs, "off", backup_dir=backups, link=link)
+    check("off applied", r["matched"] and r["lighting_mode"] == vader4.MODE_OFF, r)
+
+    blob = vader4.load_backup(listed[0])
+    dev, store, sysfs, link = _store_pad(bytes(store))
+    r = vader4.apply_lighting(vader4.XINPUT_PREFIX + sysfs, "restore", blob=blob,
+                              backup_dir=backups, link=link)
+    check("restore brings the stock lighting back", r["matched"] and bytes(store) == bytes(stock))
+    for bad in ({"action": "restore", "blob": bytes(490)}, {"action": "solid"},
+                {"action": "rainbow"}):
+        dev, store, sysfs, link = _store_pad(stock)
+        try:
+            vader4.apply_lighting(vader4.XINPUT_PREFIX + sysfs, backup_dir=backups,
+                                  link=link, **bad)
+            check(f"refused {bad['action']} without sending", False)
+        except (vader4.ProtocolError, ValueError):
+            check(f"refused {bad['action']} without sending", dev.written == [])
+
+
+def test_list_entries():
+    entries = vader4.list_entries()
+    check("list_entries is a list of vader4 entries",
+          all(e["kind"] == "vader4" and e["supported"] and e["path"] for e in entries))
+
+
 def main():
     for test in (test_frames, test_write_parcels, test_parse_dinput,
                  test_parse_xinput, test_assembler, test_lighting_codec,
@@ -726,10 +871,13 @@ def main():
                  test_backup_files,
                  test_xinput_refuses_other_products,
                  test_xinput_write_parcels_over_link,
-                 test_xinput_discovery_and_dispatch):
+                 test_xinput_discovery_and_dispatch,
+                 test_session_lock, test_snapshot_and_apply, test_list_entries):
         test()
     for root in TEMP_DIRS:
         shutil.rmtree(root, ignore_errors=True)
+    if os.path.basename(vader4.lock_path()).startswith("openflydigi-vader4-test-"):
+        os.unlink(vader4.lock_path())
     for name in FAILED:
         print(f"  FAILED: {name}")
     print(f"\n{len(PASSED)}/{len(PASSED) + len(FAILED)} passed")

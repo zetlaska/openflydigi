@@ -4106,9 +4106,229 @@ def test_a_setting_the_pad_refuses_goes_back():
           model.sleepMinutes == 30, str(model.sleepMinutes))
 
 
+# -- the Vader 4 Pro ----------------------------------------------------------
+
+def vader4_entry(path="usb:/sys/bus/usb/devices/10-6", mode="xinput"):
+    from flydigi import vader4
+    return vader4._entry(path, mode, "Flydigi VADER4")
+
+
+class FakeVader4:
+    """Stands in for `flydigi.vader4`'s session functions: records every call,
+    and never opens anything."""
+
+    BACKUP_DIR = "/nonexistent"
+
+    def __init__(self, fail=None):
+        self.calls = []
+        self.fail = fail
+        self.backups = []
+        self.lighting = {"lighting_mode": 1, "lighting_mode_name": "streamlined",
+                         "brightness": 100, "colour": "#323200"}
+
+    def _maybe_fail(self):
+        if self.fail is not None:
+            raise self.fail
+
+    def snapshot(self, path, lighting=True):
+        self.calls.append(("snapshot", path, lighting))
+        self._maybe_fail()
+        state = {"device_type": 85, "name": "Vader 4 Pro (type 85)",
+                 "firmware": "6.9.3.3", "dongle_firmware": "0.4.5.6",
+                 "battery": 100, "connection": "wch wireless", "mode": "xinput"}
+        if lighting:
+            state.update(self.lighting)
+        return state
+
+    def apply_lighting(self, path, action, colour=None, brightness=None,
+                       blob=None, backup_dir=None):
+        self.calls.append(("apply", path, action, colour, brightness, blob))
+        self._maybe_fail()
+        backup = f"/b/vader4-lighting-prewrite-{len(self.backups)}.bin"
+        self.backups.insert(0, backup)
+        if action == "solid":
+            self.lighting = {"lighting_mode": 5, "lighting_mode_name": "steady",
+                             "brightness": brightness,
+                             "colour": "#%02X%02X%02X" % colour}
+        elif action == "off":
+            self.lighting = dict(self.lighting, lighting_mode=0,
+                                 lighting_mode_name="off")
+        return dict(self.lighting, backup=backup, matched=True, packets=51)
+
+    def backup_lighting(self, path, backup_dir=None):
+        self.calls.append(("backup", path))
+        self._maybe_fail()
+        backup = f"/b/vader4-lighting-{len(self.backups)}.bin"
+        self.backups.insert(0, backup)
+        return dict(self.lighting, backup=backup)
+
+    def load_backup(self, path):
+        self.calls.append(("load", path))
+        return bytes(500)
+
+    def list_backups(self, directory=None):
+        return list(self.backups)
+
+
+def vader4_model(fake=None):
+    fake = fake or FakeVader4()
+    return models.Vader4Model(backend=fake, inline=True), fake
+
+
+def test_a_vader_4_is_listed_as_its_own_kind():
+    model, settings = devices_model()
+    model.devicesReceived([pad_entry(2, "Desk"), vader4_entry()])
+    check("the Vader 4 Pro is listed", model.count == 2, str(model.count))
+    check("and counted as its own kind",
+          (model.padCount, model.vader4Count) == (1, 1),
+          f"{model.padCount}/{model.vader4Count}")
+    row = model.index(1, 0)
+    check("under a sensible name",
+          model.data(row, models.DevicesModel.LabelRole) == "Vader 4 Pro")
+    check("with the gamepad icon",
+          model.data(row, models.DevicesModel.IconRole) == "input-gaming")
+    detail = model.data(row, models.DevicesModel.DetailRole)
+    check("its detail says how it is attached", "XInput" in detail
+          and "not driven" not in detail, detail)
+    check("a DInput one says so",
+          "DInput" in models.devices.detail(vader4_entry("/dev/hidraw9", "dinput")))
+
+
+def test_choosing_a_vader_4_never_reaches_the_pad_worker():
+    model, settings = devices_model()
+    model.devicesReceived([pad_entry(2, "Desk"), vader4_entry()])
+    pads, vaders = [], []
+    model.padSelected.connect(pads.append)
+    model.vader4Selected.connect(vaders.append)
+    before = settings.primary_pad()
+    model.select(1)
+    check("the Vader 4 page is told", vaders == ["path:usb:/sys/bus/usb/devices/10-6"],
+          str(vaders))
+    check("the pad worker is not", pads == [], str(pads))
+    check("and the daemon's preferences are untouched",
+          settings.primary_pad() == before, str(settings.primary_pad()))
+    check("the window knows it is a Vader 4",
+          model.currentKind == "vader4" and model.currentIsVader4
+          and not model.currentIsDock)
+    check("the selector is kept", model.vader4 == vaders[0])
+
+
+def test_a_poll_does_not_take_the_vader_4_off_screen():
+    """`_reselect` used to want the pad for every kind but a dock, so the next
+    enumeration would have swapped the Vader 4 page for the pad's."""
+    model, settings = devices_model()
+    entries = [pad_entry(2, "Desk"), vader4_entry()]
+    model.devicesReceived(entries)
+    model.select(0)
+    model.select(1)
+    model.devicesReceived([pad_entry(2, "Desk", path="/dev/hidraw3"), vader4_entry()])
+    check("still on the Vader 4 after a poll", model.currentKind == "vader4",
+          model.currentKind)
+
+
+def test_a_vader_4_alone_is_adopted():
+    model, settings = devices_model()
+    vaders = []
+    model.vader4Selected.connect(vaders.append)
+    model.devicesReceived([vader4_entry()])
+    check("the window opens on it", model.currentKind == "vader4", model.currentKind)
+    check("and its page is pointed at it without a click",
+          vaders == ["path:usb:/sys/bus/usb/devices/10-6"], str(vaders))
+    model.devicesReceived([vader4_entry()])
+    check("once, not on every poll", len(vaders) == 1, str(vaders))
+
+
+def test_the_vader_4_page_reads_only_when_shown():
+    model, fake = vader4_model()
+    model.setSelector("path:usb:/sys/bus/usb/devices/10-6")
+    check("choosing it while the page is hidden reads nothing", fake.calls == [],
+          str(fake.calls))
+    model.polling = True
+    check("opening the page reads info and lighting, once",
+          fake.calls == [("snapshot", "usb:/sys/bus/usb/devices/10-6", True)],
+          str(fake.calls))
+    check("info shown", model.loaded and model.firmware == "6.9.3.3"
+          and model.dongleFirmware == "0.4.5.6" and model.battery == 100
+          and "XInput" in model.connection and "wireless" in model.connection,
+          model.connection)
+    check("the type is named once", model.deviceName == "Vader 4 Pro (type 85)",
+          model.deviceName)
+    check("lighting shown", model.lightingKnown and model.lightingMode == "Streamlined"
+          and model.brightness == 100, model.lightingMode)
+    check("the battery timer is a minute", model._battery.interval() == 60_000)
+    model._battery_tick()
+    check("a battery tick reads info only",
+          fake.calls[-1] == ("snapshot", "usb:/sys/bus/usb/devices/10-6", False))
+    check("and keeps the lighting it had", model.lightingKnown)
+    model.polling = False
+    check("leaving the page stops the timer", not model._battery.isActive())
+    n = len(fake.calls)
+    model.refresh()
+    check("Look again reads once more", len(fake.calls) == n + 1)
+
+
+def test_vader_4_writes_go_through_the_one_write_path():
+    from PySide6.QtGui import QColor
+    model, fake = vader4_model()
+    model.setSelector("path:usb:/sys/bus/usb/devices/10-6")
+    model.setSolid(QColor("#00E5FF"), 60)
+    check("solid colour sent as RGB with its brightness",
+          fake.calls[-1][2:5] == ("solid", (0, 0xE5, 0xFF), 60), str(fake.calls[-1]))
+    check("the readback is what the page shows", model.lightingMode == "Steady"
+          and model.colour == "#00E5FF" and model.brightness == 60)
+    check("the prewrite backup becomes the latest",
+          model.latestBackup == "/b/vader4-lighting-prewrite-0.bin", model.latestBackup)
+    check("and the status says the readback matched", "reads back" in model.status,
+          model.status)
+    model.turnOff()
+    check("off", fake.calls[-1][2] == "off" and model.lightingMode == "Off")
+    model.backup()
+    check("a backup is one session", fake.calls[-1][0] == "backup"
+          and model.latestBackupName == "vader4-lighting-2.bin", model.latestBackupName)
+    model.restore("")
+    check("restore with no file takes the latest backup",
+          ("load", "/b/vader4-lighting-2.bin") in fake.calls
+          and fake.calls[-1][2] == "restore" and fake.calls[-1][5] == bytes(500))
+    model.restore("file:///tmp/picked.bin")
+    check("a picked file is restored", ("load", "/tmp/picked.bin") in fake.calls)
+
+
+def test_a_busy_or_missing_vader_4_says_so():
+    from flydigi import device
+    model, fake = vader4_model(FakeVader4(fail=device.DeviceBusy("held")))
+    errors = []
+    model.failed.connect(errors.append)
+    model.setSelector("path:usb:/sys/bus/usb/devices/10-6")
+    model.refresh()
+    check("a busy pad is reported, not raised", "Another OpenFlydigi session" in model.error,
+          model.error)
+    check("and signalled", len(errors) == 1)
+    check("nothing is shown as read", not model.loaded)
+    model, fake = vader4_model(FakeVader4(fail=device.DeviceNotFound("gone")))
+    model.setSelector("path:usb:/x")
+    model.turnOff()
+    check("a missing pad is reported", "not attached" in model.error, model.error)
+    model, fake = vader4_model()
+    model.refresh()
+    check("nothing selected, nothing read", fake.calls == [])
+    model.setSelector("path:usb:/x")
+    fake.backups = []
+    model.rescanBackups()
+    model.restore("")
+    check("no backup to restore is said, not attempted",
+          "no backup" in model.error and not any(c[0] == "apply" for c in fake.calls))
+
+
 def main():
     QCoreApplication.instance() or QCoreApplication([])
-    for test in (test_selecting_an_unread_profile_requests_it_once,
+    for test in (test_a_vader_4_is_listed_as_its_own_kind,
+                 test_choosing_a_vader_4_never_reaches_the_pad_worker,
+                 test_a_poll_does_not_take_the_vader_4_off_screen,
+                 test_a_vader_4_alone_is_adopted,
+                 test_the_vader_4_page_reads_only_when_shown,
+                 test_vader_4_writes_go_through_the_one_write_path,
+                 test_a_busy_or_missing_vader_4_says_so,
+                 test_selecting_an_unread_profile_requests_it_once,
                  test_a_loaded_profile_is_clean,
                  test_editing_a_key_marks_dirty_and_lands_in_the_blob,
                  test_a_recording_becomes_a_macro_row,

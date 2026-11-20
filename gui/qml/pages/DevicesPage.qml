@@ -130,6 +130,15 @@ Kirigami.ScrollablePage {
                                               card.path];
                                 if (card.firmware !== "")
                                     bits.push("firmware " + card.firmware);
+                                if (card.kind === "vader4") {
+                                    bits.push(card.path.startsWith("usb:")
+                                              ? "XInput" : "DInput");
+                                    // Its battery is only known once its page
+                                    // has read it; listing never talks to it.
+                                    if (App.vader4.selector === card.selector
+                                            && App.vader4.battery >= 0)
+                                        bits.push("battery " + App.vader4.battery + "%");
+                                }
                                 if (card.kind === "pad" && card.battery >= 0)
                                     bits.push(card.charging
                                         ? "charging"
