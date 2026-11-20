@@ -53,3 +53,8 @@ KERNEL=="uhid", TAG+="uaccess"
 # reported on the touchpad node rather than the gamepad one.
 # Matches a real DualSense too, which is harmless.
 SUBSYSTEM=="input", ATTRS{name}=="Wireless Controller*", TAG+="uaccess"
+
+# Vader 4 Pro in DInput mode: old-protocol vendor interface (interface 2).
+# 04b4 is Cypress's vendor id, so this also matches other old Flydigi pads.
+# Draft (vader4-support), not hardware-validated.
+KERNEL=="hidraw*", ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="2412", TAG+="uaccess"

@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: 2026 zetlaska
+#
+# SPDX-License-Identifier: MIT
+
+"""Vader 4 Pro (device type 105), DInput mode only. Draft, not hardware-validated.
+
+    tools/flydigi-vader4 list                     # what is attached, nothing sent
+    tools/flydigi-vader4 info                     # read-only
+    tools/flydigi-vader4 leds                     # read-only
+    tools/flydigi-vader4 leds solid '#00E5FF' --brightness 80 --experimental-write
+    tools/flydigi-vader4 leds off --experimental-write
+
+Writes refuse to run without --experimental-write, and refuse anything whose
+device type is not 105. See flydigi/vader4.py for what is and is not known.
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from flydigi import device, vader4  # noqa: E402
+
+
+def colour(text):
+    text = text.lstrip("#")
+    if len(text) != 6:
+        raise argparse.ArgumentTypeError("expected #RRGGBB")
+    return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def cmd_list(args):
+    found = False
+    for path in vader4.find_dinput_nodes():
+        print(f"dinput  {path}  04b4:2412 interface 2")
+        found = True
+    for dev in vader4.find_xinput_devices():
+        print(f"xinput  {dev}  045e:028e (not driven; switch to DInput)")
+        found = True
+    if not found:
+        print("nothing attached")
+    return 0
+
+
+def cmd_info(args):
+    with vader4.Controller(args.device) as ctrl:
+        info = vader4.read_info(ctrl)
+    pct = info.battery_percent
+    print(f"     Device : {info.device_type} ({info.name})")
+    print(f"   Firmware : {info.firmware}")
+    print(f"        MAC : {info.mac_text}")
+    print(f"    Battery : {f'{pct}%' if pct is not None else f'raw {info.battery_raw}'}")
+    print(f"        CPU : {info.cpu}, {info.connection}")
+    return 0 if info.is_vader4_pro else 2
+
+
+def cmd_leds(args):
+    writing = args.action in ("solid", "off")
+    if writing and not args.experimental_write:
+        print("refusing: lighting writes are untested on a Vader 4 Pro; "
+              "pass --experimental-write", file=sys.stderr)
+        return 2
+    with vader4.Controller(args.device) as ctrl:
+        if writing:
+            vader4.require(ctrl)
+        light = vader4.read_lighting(ctrl)
+        print(f"current: {light.describe()}")
+        if not writing:
+            return 0
+        if args.action == "off":
+            light.set_off()
+        else:
+            if args.colour is None:
+                print("solid needs a colour", file=sys.stderr)
+                return 2
+            light.set_solid(args.colour, args.brightness)
+        sent = vader4.write_lighting(ctrl, light)
+        print(f"wrote {sent} packets: {light.describe()}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--device", help="hidraw path (default: first DInput node)")
+    sub = ap.add_subparsers(dest="command", required=True)
+    sub.add_parser("list").set_defaults(func=cmd_list)
+    sub.add_parser("info").set_defaults(func=cmd_info)
+    leds = sub.add_parser("leds")
+    leds.add_argument("action", nargs="?", choices=("show", "solid", "off"), default="show")
+    leds.add_argument("colour", nargs="?", type=colour)
+    leds.add_argument("--brightness", type=int)
+    leds.add_argument("--experimental-write", action="store_true")
+    leds.set_defaults(func=cmd_leds)
+    args = ap.parse_args()
+    try:
+        return args.func(args)
+    except (device.DeviceNotFound, vader4.ProtocolError) as exc:
+        print(f"flydigi-vader4: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
