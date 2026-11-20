@@ -58,3 +58,9 @@ SUBSYSTEM=="input", ATTRS{name}=="Wireless Controller*", TAG+="uaccess"
 # 04b4 is Cypress's vendor id, so this also matches other old Flydigi pads.
 # Draft (vader4-support), not hardware-validated.
 KERNEL=="hidraw*", ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="2412", TAG+="uaccess"
+
+# Vader 4 Pro in XInput mode: the USB device node, for the raw-USB vendor
+# channel (xpad is detached from interface 0 only while a session runs).
+# 045e:028e is the generic Xbox 360 id, so this is narrowed to the product
+# string -- a real Xbox pad or another clone is left alone.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="045e", ATTR{idProduct}=="028e", ATTR{product}=="*VADER4*", TAG+="uaccess"

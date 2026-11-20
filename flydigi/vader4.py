@@ -26,10 +26,10 @@ Space Station picks the protocol by vendor id -- `IsOldProtocol()` is
            Out: 15 bytes, `A5 cmd args...`, byte 14 = 8-bit sum of 0..13.
            In:  `p[14] == A5`, `p[15]` the reply id, payload from `p[16]`.
 
-Only DInput has a transport here, because it is the one that fits this
-project's hidraw layer. XInput frames are built and parsed so a usbfs transport
-can be added without revisiting the protocol. Bluetooth / Switch modes speak
-neither.
+Both have a transport: DInput through hidraw like every other pad here, XInput
+through pyusb (python-pyusb, libusb) with xpad detached from interface 0 for
+the length of a session -- see `XInputController`. Bluetooth / Switch modes
+speak neither.
 
 Blobs (profile, lighting) move in 10-byte parcels: a start packet stating the
 parcel count, then `cmd, 10 data bytes, 0xA0, index`, each acked. A read
@@ -42,10 +42,14 @@ ten frames of RGB. flydigictl's steady colour -- frame 0 of LEDs 0..4 set,
 `loop_end = 0`, LED count 5 -- only makes sense read that way. This is the
 first thing to confirm on hardware.
 """
+import atexit
 import collections
+import contextlib
 import dataclasses
 import glob
 import os
+import threading
+import time
 
 from . import device
 
@@ -416,48 +420,272 @@ def find_dinput_nodes():
             yield path
 
 
-def find_xinput_devices():
-    """USB devices enumerating as 045e:028e -- possibly a Vader 4 Pro in XInput
-    mode, possibly a real Xbox 360 pad. Listed only; nothing opens them."""
+def _read_attr(dev, name):
+    try:
+        with open(os.path.join(dev, name)) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def find_xinput_devices(vader4_only=False):
+    """USB devices enumerating as 045e:028e, as sysfs paths. Nothing is opened.
+
+    045e:028e is the generic Xbox 360 id, so a real Microsoft pad or another
+    clone carries it too. `vader4_only` keeps the ones whose product string
+    names a VADER4 -- the first of two gates; the second is device type 105 in
+    the info reply, which `XInputController` checks before anything else.
+    """
     for dev in sorted(glob.glob("/sys/bus/usb/devices/*")):
         try:
-            with open(os.path.join(dev, "idVendor")) as fh:
-                vid = int(fh.read(), 16)
-            with open(os.path.join(dev, "idProduct")) as fh:
-                pid = int(fh.read(), 16)
-        except (OSError, ValueError):
+            vid = int(_read_attr(dev, "idVendor") or "", 16)
+            pid = int(_read_attr(dev, "idProduct") or "", 16)
+        except ValueError:
             continue
-        if (vid, pid) == (XINPUT_VID, XINPUT_PID):
-            yield dev
+        if (vid, pid) != (XINPUT_VID, XINPUT_PID):
+            continue
+        if vader4_only and XINPUT_PRODUCT_TAG not in (_read_attr(dev, "product") or "").upper():
+            continue
+        yield dev
 
 
 def find_device():
+    """First Vader 4 Pro, DInput preferred: a hidraw path, or `usb:<sysfs>`."""
     for path in find_dinput_nodes():
         return path
+    for dev in find_xinput_devices(vader4_only=True):
+        return XINPUT_PREFIX + dev
     if any(True for _ in find_xinput_devices()):
         raise device.DeviceNotFound(
-            "an XInput-mode pad (045e:028e) is attached, but only DInput mode "
-            "is driven so far -- switch the Vader 4 Pro to DInput")
+            "an Xbox 360-style pad (045e:028e) is attached, but its product "
+            "string does not name a VADER4; refusing to touch it")
     raise device.DeviceNotFound(
-        "no Vader 4 Pro in DInput mode (04b4:2412) found -- wake the pad or "
-        "check the dongle/cable")
+        "no Vader 4 Pro found (DInput 04b4:2412 or XInput 045e:028e VADER4) "
+        "-- wake the pad or check the dongle/cable")
 
 
 class Controller(device.Controller):
-    """hidraw handle on the DInput vendor interface. Reuses the base class's
-    claim, drain and send; only discovery differs."""
+    """A Vader 4 Pro session, in whichever mode the pad is in.
 
-    def __new__(cls, path=None):
-        return super().__new__(cls, path or find_device())
+    DInput: hidraw handle on the vendor interface, reusing the base class's
+    claim, drain and send. XInput: `Controller("usb:/sys/bus/usb/devices/X")`
+    -- or a bare `Controller()` when only an XInput pad is attached -- hands
+    back an `XInputController` instead, with the same send/claim/close.
+    """
+    mode = "dinput"
+
+    def __new__(cls, path=None, **kwargs):
+        path = path or find_device()
+        if path.startswith(XINPUT_PREFIX):
+            return XInputController(path[len(XINPUT_PREFIX):], **kwargs)
+        return super().__new__(cls, path)
+
+    def __init__(self, path=None, **kwargs):
+        super().__init__(path)
+
+
+# -- XInput transport ---------------------------------------------------------
+#
+# The vendor channel shares interface 0's interrupt pipes with the gamepad
+# stream, and xpad owns that interface, so a session detaches xpad from
+# interface 0 *only* (the device stays configured, nothing is reset), claims
+# it, talks, then releases and reattaches. The pad gives no game input for that
+# long. Reattaching is in `close`, which `__exit__`, every failure path in
+# `__init__` and `atexit` all reach, so an exception or Ctrl+C still hands
+# the pad back to xpad. SIGKILL cannot be caught; replugging recovers then.
+
+XINPUT_PREFIX = "usb:"
+XINPUT_PRODUCT_TAG = "VADER4"
+XINPUT_INTERFACE = 0
+XINPUT_EP_OUT = 0x05
+XINPUT_EP_IN = 0x81
+XINPUT_READ_SIZE = 64
+XINPUT_POLL_MS = 20
+
+
+# **Replies ride inside input reports.** Measured on a Vader 4 Pro over its
+# dongle (XInput, firmware 6.9.3.3): every packet on endpoint 0x81 is 32 bytes
+# and starts `00 14` like an Xbox 360 input report, and a vendor reply is one
+# of those with `A5 <reply id>` at bytes 14..15 and its payload from 16 --
+#   00 14 00..00 a5 10 55 f6 ad 33 38 33 69 04 02 00 01 ...   (info)
+# so nothing can be filtered on the header; `parse_xinput` decides.
+
+class PyUsbLink:
+    """Interface 0 of one USB device, through pyusb (python-pyusb + libusb).
+
+    `usb_core` / `usb_util` are injectable so the detach/reattach logic can be
+    tested without a device; normally they are pyusb's own modules.
+    """
+
+    def __init__(self, sysfs, usb_core=None, usb_util=None):
+        if usb_core is None or usb_util is None:
+            try:
+                import usb.core
+                import usb.util
+            except ImportError as exc:
+                raise device.DeviceNotFound(
+                    "XInput mode needs pyusb (python-pyusb) and libusb") from exc
+            usb_core, usb_util = usb.core, usb.util
+        self.core, self.util = usb_core, usb_util
+        self.sysfs = sysfs
+        self.dev = None
+        self.detached = False
+        self.claimed = False
+        bus, addr = _read_attr(sysfs, "busnum"), _read_attr(sysfs, "devnum")
+        if bus is None or addr is None:
+            raise device.DeviceNotFound(f"{sysfs}: gone")
+        self.bus, self.address = int(bus), int(addr)
+
+    def open(self):
+        dev = self.core.find(idVendor=XINPUT_VID, idProduct=XINPUT_PID,
+                             bus=self.bus, address=self.address)
+        if dev is None:
+            raise device.DeviceNotFound(f"{self.sysfs}: not on the bus")
+        self.dev = dev
+        try:
+            if dev.is_kernel_driver_active(XINPUT_INTERFACE):
+                dev.detach_kernel_driver(XINPUT_INTERFACE)
+                self.detached = True
+            self.util.claim_interface(dev, XINPUT_INTERFACE)
+            self.claimed = True
+        except BaseException:
+            self.close()
+            raise
+
+    def write(self, data):
+        n = self.dev.write(XINPUT_EP_OUT, bytes(data), timeout=500)
+        if n != len(data):
+            raise OSError("short USB interrupt write")
+
+    def read(self, timeout_ms):
+        try:
+            return bytes(self.dev.read(XINPUT_EP_IN, XINPUT_READ_SIZE, timeout=timeout_ms))
+        except self.core.USBTimeoutError:
+            return None
+
+    def close(self):
+        """Release and give interface 0 back to xpad. Safe to call twice; every
+        step is attempted even if an earlier one fails."""
+        dev, self.dev = self.dev, None
+        if dev is None:
+            return
+        errors = []
+        if self.claimed:
+            try:
+                self.util.release_interface(dev, XINPUT_INTERFACE)
+            except Exception as exc:         # noqa: BLE001 -- keep going
+                errors.append(exc)
+            self.claimed = False
+        if self.detached:
+            try:
+                dev.attach_kernel_driver(XINPUT_INTERFACE)
+                self.detached = False
+            except Exception as exc:         # noqa: BLE001
+                errors.append(exc)
+        try:
+            self.util.dispose_resources(dev)
+        except Exception as exc:             # noqa: BLE001
+            errors.append(exc)
+        if self.detached:
+            raise OSError(f"could not reattach xpad to {self.sysfs}: {errors[-1]}")
+
+
+class XInputController:
+    """Same surface as `Controller` -- `send`, `claim`, `close`, context
+    manager -- over the XInput interrupt pipes."""
+
+    mode = "xinput"
+
+    def __init__(self, sysfs, link=None, verify=True, wait=0.6,
+                 accept=(DEVICE_TYPE,)):
+        product = _read_attr(sysfs, "product") or ""
+        if XINPUT_PRODUCT_TAG not in product.upper():
+            raise device.DeviceNotFound(
+                f"{sysfs}: product {product!r} is not a VADER4; refusing")
+        self.path = XINPUT_PREFIX + sysfs
+        self.link = link if link is not None else PyUsbLink(sysfs)
+        self._threads = threading.RLock()
+        self.info = None
+        self.link.open()
+        atexit.register(self.close)
+        try:
+            if verify:
+                self.info = require(self, wait=wait, accept=accept)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        link, self.link = getattr(self, "link", None), None
+        if link is not None:
+            atexit.unregister(self.close)
+            link.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    @contextlib.contextmanager
+    def claim(self, timeout=device.CLAIM_TIMEOUT):
+        """Within one process. Across processes the USB claim itself excludes:
+        a second claimant of interface 0 gets EBUSY."""
+        if not self._threads.acquire(timeout=timeout):
+            raise device.DeviceBusy(f"another thread is using {self.path}")
+        try:
+            yield self
+        finally:
+            self._threads.release()
+
+    def _drain(self):
+        """Drop what is already queued. Bounded: the pipe streams input at
+        about 1 kHz, so it is never empty for long."""
+        for _ in range(16):
+            if self.link.read(1) is None:
+                return
+
+    def send(self, buf, wait=0.3, until=None):
+        if self.link is None:
+            raise OSError(f"{self.path} is closed")
+        with self.claim():
+            self._drain()
+            self.link.write(buf)
+            replies = []
+            deadline = time.monotonic() + wait
+            while time.monotonic() < deadline:
+                left = int((deadline - time.monotonic()) * 1000)
+                data = self.link.read(max(1, min(XINPUT_POLL_MS, left)))
+                if not data:
+                    continue
+                replies.append(data)
+                if until is not None and until(replies):
+                    break
+            return replies
+
+
+# -- mode-neutral exchanges ---------------------------------------------------
+
+def _mode(ctrl):
+    return getattr(ctrl, "mode", "dinput")
+
+
+def command(ctrl, which, *args):
+    """A request for `which` ("info", "led") framed for the controller's mode."""
+    if _mode(ctrl) == "xinput":
+        return xinput_command({"info": X_CMD_INFO, "led": X_CMD_READ_LED}[which], *args)
+    return dinput_command({"info": D_CMD_INFO, "led": D_CMD_READ_LED}[which], *args)
 
 
 def _replies(ctrl, packet, wait, until):
+    parse = parse_xinput if _mode(ctrl) == "xinput" else parse_dinput
     out = []
 
     def check(raw):
-        reply = parse_dinput(raw[-1])
-        if reply is not None:
-            out.append(reply)
+        reply = parse(raw[-1])
+        if reply is None:
+            return False
+        out.append(reply)
         return until(out)
     ctrl.send(packet, wait=wait, until=check)
     return out
@@ -465,18 +693,25 @@ def _replies(ctrl, packet, wait, until):
 
 def read_info(ctrl, wait=0.6, retries=3):
     for _ in range(retries):
-        got = _replies(ctrl, dinput_command(D_CMD_INFO), wait,
-                       lambda rs: any(r.kind == "info" for r in rs))
+        got = _replies(ctrl, command(ctrl, "info"), wait,
+                       lambda rs: rs[-1].kind == "info")
         for r in got:
             if r.kind == "info":
                 return r.info
     raise ProtocolError("no device-info reply")
 
 
-def require(ctrl, wait=0.6):
+def require(ctrl, wait=0.6, accept=(DEVICE_TYPE,)):
+    """Read the info and refuse anything whose device type is not in `accept`.
+
+    Only 105 by default. The one Vader 4 Pro measured so far reports **85**
+    (flydigictl's "Vader 4"), so 105 may be one revision rather than the model;
+    widening this is a decision for whoever has the pad in hand."""
     info = read_info(ctrl, wait=wait)
-    if not info.is_vader4_pro:
-        raise ProtocolError(f"this is a {info.name}, not a Vader 4 Pro; refusing")
+    if info.device_type not in accept:
+        raise ProtocolError(
+            f"device type {info.device_type} ({info.name}) is not one of "
+            f"{', '.join(map(str, accept))}; refusing")
     return info
 
 
@@ -485,11 +720,10 @@ def read_lighting(ctrl, cfg_id=0, wait=2.0, retries=3):
         asm = Assembler(LED_PARCELS)
 
         def until(rs):
-            r = rs[-1] if rs else None
-            if r is not None and r.kind == "led":
-                asm.add(r.index, r.data)
+            if rs[-1].kind == "led":
+                asm.add(rs[-1].index, rs[-1].data)
             return asm.done
-        _replies(ctrl, dinput_command(D_CMD_READ_LED, cfg_id), wait, until)
+        _replies(ctrl, command(ctrl, "led", cfg_id), wait, until)
         if asm.done:
             return Lighting(asm.blob)
     raise ProtocolError("lighting read did not complete")
@@ -500,12 +734,13 @@ def write_lighting(ctrl, lighting, cfg_id=0, wait=3.0, retries=3):
     hardware. A packet counts as delivered when the pad acks with a number at
     least its position in the sequence (start packet = 0), which is the rule
     flydigictl's writer uses."""
-    packets = write_parcels(lighting.blob, cfg_id, "dinput", led=True)
+    packets = write_parcels(lighting.blob, cfg_id, _mode(ctrl), led=True)
     with ctrl.claim():
         for position, packet in enumerate(packets):
+            def acked(rs, position=position):
+                return rs[-1].kind == "ack" and rs[-1].index >= position
             for _ in range(retries):
-                got = _replies(ctrl, packet, wait, lambda rs: any(
-                    r.kind == "ack" and r.index >= position for r in rs))
+                got = _replies(ctrl, packet, wait, acked)
                 if any(r.kind == "ack" and r.index >= position for r in got):
                     break
             else:

@@ -4,7 +4,11 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Vader 4 Pro (device type 105), DInput mode only. Draft, not hardware-validated.
+"""Vader 4 Pro (device type 105), DInput or XInput mode. Draft.
+
+In XInput mode (045e:028e, product "Flydigi VADER4") a session detaches xpad
+from interface 0 and reattaches it on exit, so the pad gives no game input for
+the second or two a command takes.
 
     tools/flydigi-vader4 list                     # what is attached, nothing sent
     tools/flydigi-vader4 info                     # read-only
@@ -17,6 +21,7 @@ device type is not 105. See flydigi/vader4.py for what is and is not known.
 """
 import argparse
 import os
+import signal
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,13 +36,29 @@ def colour(text):
     return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
 
 
+def accepted(args):
+    return (vader4.DEVICE_TYPE, *args.accept_type)
+
+
+def open_ctrl(args):
+    """XInput sessions verify the type on open; DInput is checked by callers."""
+    path = args.device or vader4.find_device()
+    if path.startswith(vader4.XINPUT_PREFIX):
+        return vader4.Controller(path, accept=accepted(args))
+    return vader4.Controller(path)
+
+
 def cmd_list(args):
     found = False
     for path in vader4.find_dinput_nodes():
         print(f"dinput  {path}  04b4:2412 interface 2")
         found = True
+    vaders = set(vader4.find_xinput_devices(vader4_only=True))
     for dev in vader4.find_xinput_devices():
-        print(f"xinput  {dev}  045e:028e (not driven; switch to DInput)")
+        if dev in vaders:
+            print(f"xinput  {vader4.XINPUT_PREFIX}{dev}  045e:028e VADER4")
+        else:
+            print(f"ignored {dev}  045e:028e, product does not name a VADER4")
         found = True
     if not found:
         print("nothing attached")
@@ -45,15 +66,16 @@ def cmd_list(args):
 
 
 def cmd_info(args):
-    with vader4.Controller(args.device) as ctrl:
+    with open_ctrl(args) as ctrl:
         info = vader4.read_info(ctrl)
+    print(f"       Mode : {info.mode}")
     pct = info.battery_percent
     print(f"     Device : {info.device_type} ({info.name})")
     print(f"   Firmware : {info.firmware}")
     print(f"        MAC : {info.mac_text}")
     print(f"    Battery : {f'{pct}%' if pct is not None else f'raw {info.battery_raw}'}")
     print(f"        CPU : {info.cpu}, {info.connection}")
-    return 0 if info.is_vader4_pro else 2
+    return 0 if info.device_type in accepted(args) else 2
 
 
 def cmd_leds(args):
@@ -62,9 +84,9 @@ def cmd_leds(args):
         print("refusing: lighting writes are untested on a Vader 4 Pro; "
               "pass --experimental-write", file=sys.stderr)
         return 2
-    with vader4.Controller(args.device) as ctrl:
+    with open_ctrl(args) as ctrl:
         if writing:
-            vader4.require(ctrl)
+            vader4.require(ctrl, accept=accepted(args))
         light = vader4.read_lighting(ctrl)
         print(f"current: {light.describe()}")
         if not writing:
@@ -84,7 +106,10 @@ def cmd_leds(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--device", help="hidraw path (default: first DInput node)")
+    ap.add_argument("--accept-type", type=int, action="append", default=[],
+                    help="also accept this device type (default: 105 only; "
+                         "the measured pad reports 85)")
+    ap.add_argument("--device", help="hidraw path or usb:<sysfs path> (default: first found, DInput first)")
     sub = ap.add_subparsers(dest="command", required=True)
     sub.add_parser("list").set_defaults(func=cmd_list)
     sub.add_parser("info").set_defaults(func=cmd_info)
@@ -95,9 +120,11 @@ def main():
     leds.add_argument("--experimental-write", action="store_true")
     leds.set_defaults(func=cmd_leds)
     args = ap.parse_args()
+    # SIGTERM -> SystemExit, so `with` blocks still reattach xpad.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     try:
         return args.func(args)
-    except (device.DeviceNotFound, vader4.ProtocolError) as exc:
+    except (device.DeviceNotFound, device.DeviceBusy, vader4.ProtocolError, OSError) as exc:
         print(f"flydigi-vader4: {exc}", file=sys.stderr)
         return 1
 

@@ -12,14 +12,17 @@ pad on the far end of a socket pair.
 """
 import os
 import select
+import shutil
 import socket
 import sys
+import tempfile
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flydigi import device, vader4  # noqa: E402
 
+TEMP_DIRS = []
 PASSED = []
 FAILED = []
 
@@ -282,7 +285,7 @@ def test_require_refuses_other_pads():
             vader4.require(ctrl)
             check("Vader 4 (85) refused", False)
         except vader4.ProtocolError as exc:
-            check("Vader 4 (85) refused", "Vader 4" in str(exc))
+            check("Vader 4 (85) refused", "85" in str(exc))
         ctrl.close()
     finally:
         pad.close()
@@ -326,13 +329,291 @@ def test_write_stops_without_ack():
         pad.close()
 
 
+# -- XInput -------------------------------------------------------------------
+
+class FakeTimeout(Exception):
+    pass
+
+
+class FakeDev:
+    """A pyusb device: interface 0 owned by xpad, a scripted vendor channel."""
+
+    def __init__(self, respond, events, fail_attach=False):
+        self.respond = respond
+        self.events = events
+        self.kernel = True
+        self.claimed = False
+        self.queue = [bytes([0x00, 0x14]) + bytes(18)]     # stray input report
+        self.written = []
+        self.fail_attach = fail_attach
+
+    def is_kernel_driver_active(self, intf):
+        return self.kernel
+
+    def detach_kernel_driver(self, intf):
+        self.events.append(("detach", intf))
+        self.kernel = False
+
+    def attach_kernel_driver(self, intf):
+        self.events.append(("attach", intf))
+        if self.fail_attach:
+            raise OSError("attach failed")
+        self.kernel = True
+
+    def write(self, ep, data, timeout=None):
+        assert ep == 0x05 and self.claimed and not self.kernel
+        self.written.append(bytes(data))
+        self.queue.append(bytes([0x00, 0x14]) + bytes(18))
+        self.queue.extend(self.respond(bytes(data)) or ())
+        return len(data)
+
+    def read(self, ep, size, timeout=None):
+        assert ep == 0x81
+        if self.queue:
+            return self.queue.pop(0)
+        raise FakeTimeout()
+
+
+class FakeCore:
+    USBTimeoutError = FakeTimeout
+
+    def __init__(self, dev):
+        self.dev = dev
+        self.found = None
+
+    def find(self, **kw):
+        self.found = kw
+        return self.dev
+
+
+class FakeUtil:
+    def __init__(self, dev, events, fail_claim=False):
+        self.dev, self.events, self.fail_claim = dev, events, fail_claim
+
+    def claim_interface(self, dev, intf):
+        if self.fail_claim:
+            raise OSError("busy")
+        self.events.append(("claim", intf))
+        dev.claimed = True
+
+    def release_interface(self, dev, intf):
+        self.events.append(("release", intf))
+        dev.claimed = False
+
+    def dispose_resources(self, dev):
+        self.events.append(("dispose",))
+
+
+def fake_sysfs(product="Flydigi VADER4", vid="045e", pid="028e"):
+    root = tempfile.mkdtemp(prefix="vader4-sysfs-")
+    TEMP_DIRS.append(root)
+    for name, value in (("product", product), ("idVendor", vid), ("idProduct", pid),
+                        ("busnum", "10"), ("devnum", "17")):
+        with open(os.path.join(root, name), "w") as fh:
+            fh.write(value + "\n")
+    return root
+
+
+def x_reply(cmd, payload=b""):
+    p = bytearray(32)
+    p[0], p[1] = 0x00, 0x14                  # replies ride in input reports
+    p[14], p[15] = 0xA5, cmd
+    p[16:16 + len(payload)] = payload
+    return bytes(p)
+
+
+def x_info(device_type=105):
+    return x_reply(16, bytes([device_type]) + b"\xaa\xbb\xcc\xdd"
+                   + bytes([0x00, 0x61, 3, 1, 2, 1]))
+
+
+def x_pad(respond=None, product="Flydigi VADER4", fail_attach=False, fail_claim=False,
+          device_type=105, stored=None):
+    events = []
+    stored = stored if stored is not None else bytes(490)
+
+    def default(packet):
+        if packet[1] == 16:
+            return [x_info(device_type)]
+        if packet[1] == 38:
+            return [x_reply(39, bytes([i]) + stored[i * 10:(i + 1) * 10])
+                    for i in range(len(stored) // 10)]
+        return []
+    dev = FakeDev(respond or default, events, fail_attach)
+    sysfs = fake_sysfs(product)
+    link = vader4.PyUsbLink(sysfs, FakeCore(dev), FakeUtil(dev, events, fail_claim))
+    return dev, events, sysfs, link
+
+
+def test_xinput_session_detaches_and_reattaches():
+    stored = bytearray(490)
+    stored[6], stored[7], stored[8] = 70, 5, vader4.MODE_STEADY
+    stored[20:23] = b"\x00\xe5\xff"
+    dev, events, sysfs, link = x_pad(stored=bytes(stored))
+    check("link targets bus/address from sysfs", (link.bus, link.address) == (10, 17))
+    with vader4.XInputController(sysfs, link=link) as ctrl:
+        check("detached interface 0 only, then claimed",
+              events[:2] == [("detach", 0), ("claim", 0)], events)
+        check("verified type 105 on open", ctrl.info.is_vader4_pro and ctrl.info.mode == "xinput")
+        check("first frame was the info request", dev.written[0] == vader4.xinput_command(16))
+        check("xinput frames are summed", dev.written[0][14] == (0xA5 + 16) & 0xFF)
+        info = vader4.read_info(ctrl)
+        check("read_info in xinput", info.firmware == "6.1.0.0" and info.connection == "wireless",
+              (info.firmware, info.connection))
+        light = vader4.read_lighting(ctrl)
+        check("lighting read in xinput", light.describe() == "steady, brightness 70/100 #00E5FF",
+              light.describe())
+        check("led read request", dev.written[-1] == vader4.xinput_command(38, 0))
+    check("released and reattached on exit",
+          events[-3:] == [("release", 0), ("attach", 0), ("dispose",)], events)
+    check("xpad owns it again", dev.kernel)
+    ctrl.close()
+    check("close is idempotent", events.count(("attach", 0)) == 1)
+
+
+def test_xinput_reattaches_on_errors():
+    dev, events, sysfs, link = x_pad(device_type=85)
+    try:
+        vader4.XInputController(sysfs, link=link)
+        check("type 85 over xinput refused", False)
+    except vader4.ProtocolError:
+        check("type 85 over xinput refused", True)
+    check("refusal reattached xpad", dev.kernel and ("attach", 0) in events, events)
+
+    dev, events, sysfs, link = x_pad()
+    try:
+        with vader4.XInputController(sysfs, link=link):
+            raise KeyboardInterrupt
+    except KeyboardInterrupt:
+        pass
+    check("Ctrl+C reattached xpad", dev.kernel and events[-2] == ("attach", 0), events)
+
+    dev, events, sysfs, link = x_pad(fail_claim=True)
+    try:
+        vader4.XInputController(sysfs, link=link)
+        check("claim failure raised", False)
+    except OSError:
+        check("claim failure raised", True)
+    check("claim failure reattached xpad", dev.kernel and ("attach", 0) in events, events)
+
+    dev, events, sysfs, link = x_pad(respond=lambda p: [])
+    try:
+        vader4.XInputController(sysfs, link=link, wait=0.05)
+        check("silent pad raises", False)
+    except vader4.ProtocolError:
+        check("silent pad raises", True)
+    check("silent pad reattached xpad", dev.kernel)
+
+    dev, events, sysfs, link = x_pad(fail_attach=True)
+    ctrl = vader4.XInputController(sysfs, link=link)
+    try:
+        ctrl.close()
+        check("failed reattach is reported", False)
+    except OSError as exc:
+        check("failed reattach is reported", "reattach" in str(exc))
+    check("release still happened", ("release", 0) in events)
+
+
+def test_xinput_real_capture():
+    """Packets captured from the real pad (XInput over its dongle)."""
+    info = vader4.parse_xinput(bytes.fromhex(
+        "0014000000000000000000000000a51055f6ad33383369040200010000004000"))
+    check("captured info parses", info is not None and info.kind == "info")
+    i = info.info
+    check("captured: type 85, fw 6.9.3.3, battery 100%, wch wireless",
+          (i.device_type, i.firmware, i.battery_percent, i.cpu, i.connection)
+          == (85, "6.9.3.3", 100, "wch", "wireless"),
+          (i.device_type, i.firmware, i.battery_percent, i.cpu, i.connection))
+    dongle = vader4.parse_xinput(bytes.fromhex(
+        "0014000000000000000000000000a51104560000000000000000000010000000"))
+    check("captured dongle reply", dongle.kind == "dongle" and dongle.data == b"\x04\x56")
+    check("plain input report is not a reply",
+          vader4.parse_xinput(bytes([0, 0x14]) + bytes(30)) is None)
+
+
+def test_xinput_accept_types():
+    dev, events, sysfs, link = x_pad(device_type=85)
+    with vader4.XInputController(sysfs, link=link, accept=(85, 105)) as ctrl:
+        check("type 85 accepted when asked", ctrl.info.device_type == 85)
+    check("accept session reattached", dev.kernel)
+
+
+def test_xinput_refuses_other_products():
+    dev, events, sysfs, link = x_pad(product="Controller")
+    try:
+        vader4.XInputController(sysfs, link=link)
+        check("non-VADER4 product refused", False)
+    except device.DeviceNotFound:
+        check("non-VADER4 product refused", True)
+    check("nothing detached for a stranger", events == [] and dev.written == [], events)
+
+
+def test_xinput_write_parcels_over_link():
+    def respond(packet):
+        if packet[1] == 16:
+            return [x_info()]
+        if packet[1] == 42:
+            return [x_reply(42)]
+        if packet[1] == 41:
+            return [x_reply(41, bytes([packet[13] + 1]))]
+        return []
+    dev, events, sysfs, link = x_pad(respond=respond)
+    with vader4.XInputController(sysfs, link=link) as ctrl:
+        light = vader4.Lighting(bytes(490))
+        light.set_solid((1, 2, 3), 50)
+        sent = vader4.write_lighting(ctrl, light, wait=0.3)
+    check("xinput write sent start + 49", sent == 50)
+    check("xinput write bytes", dev.written[1:] == vader4.write_parcels(light.blob, 0, "xinput"))
+    check("reattached after write", dev.kernel)
+
+
+def test_xinput_discovery_and_dispatch():
+    vader = fake_sysfs()
+    xbox = fake_sysfs(product="Controller")
+    saved = (vader4.glob.glob,)
+    try:
+        def fake_glob(pattern):
+            if pattern.startswith("/sys/bus/usb/devices"):
+                return [xbox, vader]
+            return []
+        vader4.glob.glob = fake_glob
+        every = list(vader4.find_xinput_devices())
+        only = list(vader4.find_xinput_devices(vader4_only=True))
+        check("both 028e devices seen", sorted(every) == sorted([vader, xbox]))
+        check("only the VADER4 kept", only == [vader], only)
+        check("find_device falls back to xinput", vader4.find_device() == "usb:" + vader)
+        vader4.glob.glob = lambda pattern: [xbox] if pattern.startswith("/sys") else []
+        try:
+            vader4.find_device()
+            check("lone Xbox pad refused", False)
+        except device.DeviceNotFound as exc:
+            check("lone Xbox pad refused", "VADER4" in str(exc))
+    finally:
+        vader4.glob.glob, = saved
+    dev, events, sysfs, link = x_pad()
+    ctrl = vader4.Controller("usb:" + sysfs, link=link)
+    check("Controller dispatches usb: paths", isinstance(ctrl, vader4.XInputController)
+          and ctrl.mode == "xinput")
+    ctrl.close()
+    check("dispatch session reattached", dev.kernel)
+
+
 def main():
     for test in (test_frames, test_write_parcels, test_parse_dinput,
                  test_parse_xinput, test_assembler, test_lighting_codec,
                  test_discovery, test_transport_reads,
                  test_require_refuses_other_pads, test_write_lighting,
-                 test_write_stops_without_ack):
+                 test_write_stops_without_ack,
+                 test_xinput_session_detaches_and_reattaches,
+                 test_xinput_reattaches_on_errors,
+                 test_xinput_real_capture,
+                 test_xinput_accept_types,
+                 test_xinput_refuses_other_products,
+                 test_xinput_write_parcels_over_link,
+                 test_xinput_discovery_and_dispatch):
         test()
+    for root in TEMP_DIRS:
+        shutil.rmtree(root, ignore_errors=True)
     for name in FAILED:
         print(f"  FAILED: {name}")
     print(f"\n{len(PASSED)}/{len(PASSED) + len(FAILED)} passed")
