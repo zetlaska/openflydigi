@@ -35,7 +35,8 @@ Blobs (profile, lighting) move in 10-byte parcels: a start packet stating the
 parcel count, then `cmd, 10 data bytes, 0xA0, index`, each acked. A read
 streams parcels back in order -- 52 for a profile, 49 (490 bytes) for lighting.
 
-**Lighting layout is LED-major**, unlike the Apex 5's frame-major blob in
+**Lighting layout is LED-major** (confirmed: the stock streamlined blob read
+back from the pad is exactly flydigictl's per-LED rainbow table), unlike the Apex 5's frame-major blob in
 `lighting.py`: header bytes 0..19 sit at the same offsets (version, type,
 loop start/end, cycle time, brightness, LED count, mode), then for each LED
 ten frames of RGB. flydigictl's steady colour -- frame 0 of LEDs 0..4 set,
@@ -58,15 +59,25 @@ DINPUT_INTERFACE = 2
 XINPUT_VID, XINPUT_PID = 0x045E, 0x028E
 
 DEVICE_TYPE = 105
+# What a session accepts by default. flydigictl lists the Vader 4 Pro as 105;
+# the one measured here -- product "Flydigi VADER4", firmware 6.9.3.3 -- reports
+# 85, which flydigictl calls "Vader 4". Both are the same old protocol and the
+# same 500-byte lighting blob (measured on the 85). Anything else is refused.
+ACCEPTED_TYPES = (105, 85)
 # Other pads that answer the same old protocol, so a refusal can say what it
 # found. flydigictl's tables; only 105 is what this module is for.
 KNOWN_TYPES = {19: "Apex 2", 80: "Vader 3 Pro", 81: "Vader 3 Pro ONE PIECE",
-               85: "Vader 4", 105: "Vader 4 Pro"}
+               85: "Vader 4 Pro (type 85)", 105: "Vader 4 Pro"}
 
 PARCEL_DATA = 10
 SEQ_MARK = 0xA0
 CONFIG_PARCELS = 52
-LED_PARCELS = 49
+# **The pad streams 50 lighting parcels, 500 bytes**, measured: indices 0..49
+# in reply to a read. flydigictl's reader stops at 49 (490 bytes) and drops the
+# last, while its writer sends 500 for off/streamlined -- so 490 was its
+# reader's limit, not the pad's size. 20 header bytes + 16 LEDs x 10 frames x 3.
+LED_PARCELS = 50
+LED_BLOB_LEN = LED_PARCELS * 10
 
 # -- DInput ------------------------------------------------------------------
 D_REPORT = 0x05
@@ -212,7 +223,7 @@ class Info:
 
     @property
     def is_vader4_pro(self):
-        return self.device_type == DEVICE_TYPE
+        return self.device_type in ACCEPTED_TYPES
 
     @property
     def battery_percent(self):
@@ -390,6 +401,24 @@ class Lighting:
         self.blob[OFF_MODE] = MODE_STEADY
         if brightness is not None:
             self.brightness = brightness
+
+    def fields(self):
+        """The decoded header and the first frame of each LED, for a sidecar."""
+        return {
+            "length": len(self.blob),
+            "version": self.blob[0:2].hex(),
+            "type": self.blob[OFF_TYPE],
+            "loop_start": self.blob[OFF_LOOP_START],
+            "loop_end": self.blob[OFF_LOOP_END],
+            "cycle_time": self.cycle_time,
+            "brightness": self.brightness,
+            "led_count": self.led_count,
+            "mode": self.mode,
+            "mode_name": self.mode_name,
+            "reserved": self.blob[9:OFF_FRAMES].hex(),
+            "leds": [["#%02X%02X%02X" % self.led(led, f) for f in range(FRAMES_PER_LED)]
+                     for led in range(self.slots)],
+        }
 
     def describe(self):
         text = f"{self.mode_name}, brightness {self.brightness}/{BRIGHTNESS_MAX}"
@@ -597,7 +626,7 @@ class XInputController:
     mode = "xinput"
 
     def __init__(self, sysfs, link=None, verify=True, wait=0.6,
-                 accept=(DEVICE_TYPE,)):
+                 accept=ACCEPTED_TYPES):
         product = _read_attr(sysfs, "product") or ""
         if XINPUT_PRODUCT_TAG not in product.upper():
             raise device.DeviceNotFound(
@@ -638,6 +667,28 @@ class XInputController:
         finally:
             self._threads.release()
 
+    # **The dongle drops a frame identical to the one before it**, as the Vader
+    # 5's receiver does (device.REPEAT_WINDOW): measured here, an info request
+    # straight after another got no answer, three times running. So a repeat
+    # inside the window is preceded by a read-only separator -- the dongle
+    # version request, or device info when the repeat is itself that.
+    _last_frame = None
+    _last_sent = 0.0
+
+    def _separate(self, buf):
+        if (bytes(buf) != self._last_frame
+                or time.monotonic() - self._last_sent >= device.REPEAT_WINDOW):
+            return
+        cmd = X_CMD_INFO if buf[1] == X_CMD_DONGLE else X_CMD_DONGLE
+        sep = xinput_command(cmd)
+        self.link.write(sep)
+        self._last_frame, self._last_sent = sep, time.monotonic()
+        deadline = time.monotonic() + 0.25
+        while time.monotonic() < deadline:
+            data = self.link.read(XINPUT_POLL_MS)
+            if data and len(data) > 15 and data[14] == X_MAGIC and data[15] == cmd:
+                return
+
     def _drain(self):
         """Drop what is already queued. Bounded: the pipe streams input at
         about 1 kHz, so it is never empty for long."""
@@ -650,7 +701,9 @@ class XInputController:
             raise OSError(f"{self.path} is closed")
         with self.claim():
             self._drain()
+            self._separate(buf)
             self.link.write(buf)
+            self._last_frame, self._last_sent = bytes(buf), time.monotonic()
             replies = []
             deadline = time.monotonic() + wait
             while time.monotonic() < deadline:
@@ -701,18 +754,20 @@ def read_info(ctrl, wait=0.6, retries=3):
     raise ProtocolError("no device-info reply")
 
 
-def require(ctrl, wait=0.6, accept=(DEVICE_TYPE,)):
-    """Read the info and refuse anything whose device type is not in `accept`.
-
-    Only 105 by default. The one Vader 4 Pro measured so far reports **85**
-    (flydigictl's "Vader 4"), so 105 may be one revision rather than the model;
-    widening this is a decision for whoever has the pad in hand."""
+def require(ctrl, wait=0.6, accept=ACCEPTED_TYPES):
+    """Read the info and refuse anything whose device type is not in `accept`
+    (105 and 85 by default; see ACCEPTED_TYPES)."""
     info = read_info(ctrl, wait=wait)
     if info.device_type not in accept:
         raise ProtocolError(
             f"device type {info.device_type} ({info.name}) is not one of "
             f"{', '.join(map(str, accept))}; refusing")
     return info
+
+
+def read_lighting_raw(ctrl, cfg_id=0, wait=2.0, retries=3):
+    """The whole lighting blob as the pad streams it, every parcel, unparsed."""
+    return bytes(read_lighting(ctrl, cfg_id, wait, retries).blob)
 
 
 def read_lighting(ctrl, cfg_id=0, wait=2.0, retries=3):
@@ -729,19 +784,54 @@ def read_lighting(ctrl, cfg_id=0, wait=2.0, retries=3):
     raise ProtocolError("lighting read did not complete")
 
 
-def write_lighting(ctrl, lighting, cfg_id=0, wait=3.0, retries=3):
-    """Stream a lighting blob back, one acked packet at a time. UNTESTED on
-    hardware. A packet counts as delivered when the pad acks with a number at
-    least its position in the sequence (start packet = 0), which is the rule
-    flydigictl's writer uses."""
-    packets = write_parcels(lighting.blob, cfg_id, _mode(ctrl), led=True)
+def _start_cmd(mode):
+    return X_CMD_LED_START if mode == "xinput" else D_CMD_LED_START
+
+
+def _pack_cmd(mode):
+    return X_CMD_LED_PACK if mode == "xinput" else D_CMD_LED_PACK
+
+
+def write_lighting(ctrl, lighting, cfg_id=0, wait=3.0, retries=3, acks=None):
+    """Stream a lighting blob back, one acked packet at a time.
+
+    The start packet needs the start-ack (any number). Data parcel `k` needs a
+    pack-ack numbered `k` or `k + 1`, read *after* it was sent. flydigictl
+    accepts any ack >= the packet's position (start = 0, parcel k = k + 1),
+    which only works if the pad numbers acks one ahead. **Measured: it does**
+    -- over XInput on the type-85 pad, start acked 0, parcel k acked k + 1, 51
+    acks for 51 packets, and the readback matched the blob byte for byte (a
+    solid write and a restore, 2026-11-20). `k` is still accepted so DInput, not
+    yet measured, has the same margin; a lower or stray number is refused.
+    Each ack seen is appended to `acks` as (position, ack number) when given.
+
+    A failure stops before the next parcel. The pad takes short blobs too
+    (flydigictl's steady colour is 17 parcels), so it evidently stores parcels
+    in place: a cut-off write leaves a mix, which a full rewrite replaces.
+    """
+    mode = _mode(ctrl)
+    blob = bytes(lighting.blob)
+    if len(blob) != LED_BLOB_LEN:
+        raise ProtocolError(f"lighting blob is {len(blob)} bytes, expected {LED_BLOB_LEN}")
+    packets = write_parcels(blob, cfg_id, mode, led=True)
+    start_cmd, pack_cmd = _start_cmd(mode), _pack_cmd(mode)
     with ctrl.claim():
         for position, packet in enumerate(packets):
-            def acked(rs, position=position):
-                return rs[-1].kind == "ack" and rs[-1].index >= position
+            if position == 0:
+                def ok(r):
+                    return r.kind == "ack" and r.data[:1] == bytes((start_cmd,))
+            else:
+                k = position - 1
+
+                def ok(r, k=k):
+                    return (r.kind == "ack" and r.data[:1] == bytes((pack_cmd,))
+                            and r.index in (k, k + 1))
             for _ in range(retries):
-                got = _replies(ctrl, packet, wait, acked)
-                if any(r.kind == "ack" and r.index >= position for r in got):
+                got = _replies(ctrl, packet, wait, lambda rs: ok(rs[-1]))
+                hit = [r for r in got if ok(r)]
+                if acks is not None:
+                    acks.extend((position, r.index) for r in got if r.kind == "ack")
+                if hit:
                     break
             else:
                 raise ProtocolError(f"no ack for packet {position} of {len(packets)}")

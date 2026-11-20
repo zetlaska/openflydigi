@@ -127,8 +127,8 @@ def test_write_parcels():
     check("xinput parcel index", x[2][1] == 41 and x[2][12:14] == bytes([0xA0, 1]))
     xc = vader4.write_parcels(blob, 4, "xinput", led=False)
     check("xinput config start", xc[0][:5] == bytes([0xA5, 37, 3, 0xA0, 4]))
-    check("490-byte lighting is 49 parcels + start",
-          len(vader4.write_parcels(bytes(490), 0)) == 50)
+    check("500-byte lighting is 50 parcels + start",
+          len(vader4.write_parcels(bytes(500), 0)) == 51)
     try:
         vader4.write_parcels(bytes(10), 0, "bluetooth")
         check("unknown mode refused", False)
@@ -192,15 +192,15 @@ def test_assembler():
 
 
 def test_lighting_codec():
-    blob = bytearray(490)
+    blob = bytearray(500)
     blob[6], blob[7], blob[8] = 80, 5, vader4.MODE_STEADY
     off = vader4.OFF_FRAMES + (2 * 10 + 0) * 3      # LED 2, frame 0
     blob[off:off + 3] = b"\x01\x02\x03"
     light = vader4.Lighting(blob)
     check("LED-major offsets", light.led(2, 0) == (1, 2, 3))
-    check("15 whole LED slots in 490 bytes", light.slots == 15, light.slots)
+    check("16 whole LED slots in 500 bytes", light.slots == 16, light.slots)
     light.set_solid((0, 0xE5, 0xFF), brightness=150)
-    check("solid keeps length", len(light.blob) == 490)
+    check("solid keeps length", len(light.blob) == 500)
     check("solid mode", light.mode == vader4.MODE_STEADY and light.led_count == 5)
     check("brightness clamped", light.brightness == 100)
     check("solid frame 0 of LEDs 0..4",
@@ -212,7 +212,7 @@ def test_lighting_codec():
     check("off", light.mode == vader4.MODE_OFF and light.led(0, 0) == (0, 0, 0)
           and light.led_count == 0)
     try:
-        light.led(15, 0)
+        light.led(16, 0)
         check("led bound", False)
     except IndexError:
         check("led bound", True)
@@ -251,7 +251,7 @@ def _led_stream(blob):
 
 
 def test_transport_reads():
-    stored = bytearray(490)
+    stored = bytearray(500)
     stored[6], stored[7], stored[8] = 55, 5, vader4.MODE_STEADY
     stored[20:23] = b"\x10\x20\x30"
     noise = bytes(32)                        # an input report, not a reply
@@ -278,14 +278,14 @@ def test_transport_reads():
 
 
 def test_require_refuses_other_pads():
-    pad = ScriptedPad(lambda p: [info_report(device_type=85)])
+    pad = ScriptedPad(lambda p: [info_report(device_type=80)])
     try:
         ctrl = pad.controller()
         try:
             vader4.require(ctrl)
-            check("Vader 4 (85) refused", False)
+            check("Vader 3 Pro (80) refused", False)
         except vader4.ProtocolError as exc:
-            check("Vader 4 (85) refused", "85" in str(exc))
+            check("Vader 3 Pro (80) refused", "80" in str(exc))
         ctrl.close()
     finally:
         pad.close()
@@ -301,10 +301,10 @@ def test_write_lighting():
     pad = ScriptedPad(respond)
     try:
         ctrl = pad.controller()
-        light = vader4.Lighting(bytes(490))
+        light = vader4.Lighting(bytes(500))
         light.set_solid((255, 0, 0), 80)
         sent = vader4.write_lighting(ctrl, light, wait=0.5)
-        check("write sent start + 49 parcels", sent == 50 and len(pad.written) == 50,
+        check("write sent start + 50 parcels", sent == 51 and len(pad.written) == 51,
               (sent, len(pad.written)))
         check("written bytes are the parcels",
               pad.written == vader4.write_parcels(light.blob, 0, "dinput", led=True))
@@ -318,7 +318,7 @@ def test_write_stops_without_ack():
     try:
         ctrl = pad.controller()
         try:
-            vader4.write_lighting(ctrl, vader4.Lighting(bytes(490)), wait=0.05, retries=2)
+            vader4.write_lighting(ctrl, vader4.Lighting(bytes(500)), wait=0.05, retries=2)
             check("silent pad aborts the write", False)
         except vader4.ProtocolError:
             check("silent pad aborts the write", True)
@@ -430,7 +430,7 @@ def x_info(device_type=105):
 def x_pad(respond=None, product="Flydigi VADER4", fail_attach=False, fail_claim=False,
           device_type=105, stored=None):
     events = []
-    stored = stored if stored is not None else bytes(490)
+    stored = stored if stored is not None else bytes(500)
 
     def default(packet):
         if packet[1] == 16:
@@ -446,7 +446,7 @@ def x_pad(respond=None, product="Flydigi VADER4", fail_attach=False, fail_claim=
 
 
 def test_xinput_session_detaches_and_reattaches():
-    stored = bytearray(490)
+    stored = bytearray(500)
     stored[6], stored[7], stored[8] = 70, 5, vader4.MODE_STEADY
     stored[20:23] = b"\x00\xe5\xff"
     dev, events, sysfs, link = x_pad(stored=bytes(stored))
@@ -472,12 +472,12 @@ def test_xinput_session_detaches_and_reattaches():
 
 
 def test_xinput_reattaches_on_errors():
-    dev, events, sysfs, link = x_pad(device_type=85)
+    dev, events, sysfs, link = x_pad(device_type=80)
     try:
         vader4.XInputController(sysfs, link=link)
-        check("type 85 over xinput refused", False)
+        check("type 80 over xinput refused", False)
     except vader4.ProtocolError:
-        check("type 85 over xinput refused", True)
+        check("type 80 over xinput refused", True)
     check("refusal reattached xpad", dev.kernel and ("attach", 0) in events, events)
 
     dev, events, sysfs, link = x_pad()
@@ -533,9 +533,122 @@ def test_xinput_real_capture():
 
 def test_xinput_accept_types():
     dev, events, sysfs, link = x_pad(device_type=85)
-    with vader4.XInputController(sysfs, link=link, accept=(85, 105)) as ctrl:
-        check("type 85 accepted when asked", ctrl.info.device_type == 85)
+    with vader4.XInputController(sysfs, link=link) as ctrl:
+        check("type 85 accepted by default", ctrl.info.device_type == 85
+              and ctrl.info.is_vader4_pro)
     check("accept session reattached", dev.kernel)
+    dev, events, sysfs, link = x_pad(device_type=81)
+    with vader4.XInputController(sysfs, link=link, accept=(81,)) as ctrl:
+        check("other type accepted only when asked", ctrl.info.device_type == 81)
+
+
+def test_xinput_repeat_is_separated():
+    """The dongle ignores a frame identical to the previous one."""
+    last = [None]
+
+    def respond(packet):
+        if packet == last[0]:
+            return []
+        last[0] = packet
+        if packet[1] == 16:
+            return [x_info()]
+        if packet[1] == 17:
+            return [x_reply(17, b"\x04\x56")]
+        return []
+    dev, events, sysfs, link = x_pad(respond=respond)
+    with vader4.XInputController(sysfs, link=link) as ctrl:
+        info = vader4.read_info(ctrl, retries=1)
+        check("repeat info answered", info.device_type == 105)
+        check("a dongle-version separator went between",
+              dev.written[-2] == vader4.xinput_command(17)
+              and dev.written[-1] == vader4.xinput_command(16), [w[1] for w in dev.written])
+    check("separated session reattached", dev.kernel)
+
+
+def _ack_pad(ack_for):
+    """XInput fake whose data-parcel ack number is ack_for(k)."""
+    def respond(packet):
+        if packet[1] == 16:
+            return [x_info()]
+        if packet[1] == 42:
+            return [x_reply(42)]
+        if packet[1] == 41:
+            got = ack_for(packet[13])
+            return [] if got is None else [x_reply(*got)] if isinstance(got, tuple) \
+                else [x_reply(41, bytes([got]))]
+        return []
+    return x_pad(respond=respond)
+
+
+def test_ack_conventions():
+    for label, rule in (("acks numbered k", lambda k: k),
+                        ("acks numbered k+1", lambda k: k + 1)):
+        dev, events, sysfs, link = _ack_pad(rule)
+        acks = []
+        with vader4.XInputController(sysfs, link=link) as ctrl:
+            sent = vader4.write_lighting(ctrl, vader4.Lighting(bytes(500)), wait=0.3, acks=acks)
+        check(f"{label}: accepted", sent == 51 and len(dev.written) == 52, len(dev.written))
+        check(f"{label}: recorded", len(acks) == 51)
+    for label, rule in (("stale ack (k-1)", lambda k: k - 1 if k else 0),
+                        ("wrong command ack", lambda k: (36, bytes([k + 1])))):
+        dev, events, sysfs, link = _ack_pad(rule)
+        try:
+            with vader4.XInputController(sysfs, link=link) as ctrl:
+                vader4.write_lighting(ctrl, vader4.Lighting(bytes(500)), wait=0.05, retries=2)
+            check(f"{label}: refused", False)
+        except vader4.ProtocolError:
+            check(f"{label}: refused", True)
+        # parcel 0 (its ack 0 is valid), then parcel 1 twice -- separators aside
+        packs = [w for w in dev.written if w[1] == 41]
+        check(f"{label}: stopped early", len(packs) <= 3, len(packs))
+        check(f"{label}: xpad back", dev.kernel)
+    dev, events, sysfs, link = _ack_pad(lambda k: k)
+    with vader4.XInputController(sysfs, link=link) as ctrl:
+        try:
+            vader4.write_lighting(ctrl, vader4.Lighting(bytes(490)))
+            check("short blob refused before sending", False)
+        except vader4.ProtocolError:
+            check("short blob refused before sending", len(dev.written) == 1)
+
+
+def test_backup_files():
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "tools", "flydigi-vader4")
+    loader = importlib.machinery.SourceFileLoader("flydigi_vader4_tool", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    tool = importlib.util.module_from_spec(spec)
+    loader.exec_module(tool)
+    tool.BACKUP_DIR = tempfile.mkdtemp(prefix="vader4-backups-")
+    TEMP_DIRS.append(tool.BACKUP_DIR)
+    blob = bytearray(500)
+    blob[0:2], blob[4], blob[5], blob[6], blob[7], blob[8] = b"\x00\x02", 5, 50, 100, 5, 1
+    blob[20:23] = b"\x32\x32\x00"
+    info = vader4.parse_xinput(x_info(85)).info
+    first = tool.save_backup(bytes(blob), info)
+    second = tool.save_backup(bytes(blob), info)
+    check("backup names are unique", first != second and os.path.exists(second))
+    check("backup is the raw bytes", open(first, "rb").read() == bytes(blob))
+    import json
+    side = json.load(open(first[:-4] + ".json"))
+    check("sidecar decodes", side["lighting"]["mode_name"] == "streamlined"
+          and side["lighting"]["leds"][0][0] == "#323200" and side["device_type"] == 85)
+    check("load_backup round-trips", tool.load_backup(first) == bytes(blob))
+    with open(first, "r+b") as fh:
+        fh.write(b"\x01")
+    try:
+        tool.load_backup(first)
+        check("tampered backup refused", False)
+    except vader4.ProtocolError:
+        check("tampered backup refused", True)
+    short = os.path.join(tool.BACKUP_DIR, "short.bin")
+    open(short, "wb").write(bytes(490))
+    try:
+        tool.load_backup(short)
+        check("490-byte backup refused", False)
+    except vader4.ProtocolError:
+        check("490-byte backup refused", True)
 
 
 def test_xinput_refuses_other_products():
@@ -559,10 +672,10 @@ def test_xinput_write_parcels_over_link():
         return []
     dev, events, sysfs, link = x_pad(respond=respond)
     with vader4.XInputController(sysfs, link=link) as ctrl:
-        light = vader4.Lighting(bytes(490))
+        light = vader4.Lighting(bytes(500))
         light.set_solid((1, 2, 3), 50)
         sent = vader4.write_lighting(ctrl, light, wait=0.3)
-    check("xinput write sent start + 49", sent == 50)
+    check("xinput write sent start + 50", sent == 51)
     check("xinput write bytes", dev.written[1:] == vader4.write_parcels(light.blob, 0, "xinput"))
     check("reattached after write", dev.kernel)
 
@@ -608,6 +721,9 @@ def main():
                  test_xinput_reattaches_on_errors,
                  test_xinput_real_capture,
                  test_xinput_accept_types,
+                 test_ack_conventions,
+                 test_xinput_repeat_is_separated,
+                 test_backup_files,
                  test_xinput_refuses_other_products,
                  test_xinput_write_parcels_over_link,
                  test_xinput_discovery_and_dispatch):
